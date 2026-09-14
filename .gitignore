@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+credentials*.json
+secrets*.json
+
+# Test output and local plugin data
+coverage/
+.vitest/
+data.json
+*.log
+
+# Build and tool caches (release artifacts in dist/ are intentionally tracked)
+.cache/
+.eslintcache
+*.tsbuildinfo
+tmp/
+temp/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

@@ -1,0 +1,34 @@
+{
+  "name": "obsidian-korean-render",
+  "version": "0.1.0",
+  "description": "Korean Render: a conservative Korean IME workaround for Obsidian Mobile Live Preview",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "build": "npm run typecheck && node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "obsidian",
+    "ios",
+    "korean",
+    "ime",
+    "codemirror"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@types/node": "^22.15.17",
+    "esbuild": "^0.25.10",
+    "eslint": "^9.39.4",
+    "globals": "^16.4.0",
+    "obsidian": "1.13.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.46.1",
+    "vite": "6.4.3",
+    "vitest": "4.1.11"
+  }
+}
