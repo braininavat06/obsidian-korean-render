@@ -2,7 +2,6 @@ import type {
   BeforeInputSignal,
   KeySignal,
   SelectionMoveSignal,
-  SelectionOrigin,
   SelectionSnapshot,
 } from "./ime-state-machine";
 
@@ -37,12 +36,8 @@ export type PseudoDecision =
       replace: TextRange;
       staleText: string;
       originalText: string;
+      source: "derived" | "pending-intended-key";
     }
-  | {
-      kind: "suppress-stale-insert";
-      reason: string;
-      staleText: string;
-    };
 
 export type AtomicRepairDecision = Extract<PseudoDecision, { kind: "atomic-repair" }>;
 
@@ -74,14 +69,11 @@ interface MovedPseudoComposition {
   sourceRange: TextRange;
   sourceText: string;
   destination: SelectionSnapshot;
-  movedAt: number;
-  origin: SelectionOrigin;
   intended?: { range: TextRange; text: string };
 }
 
 export const PSEUDO_REWRITE_PAIR_MS = 80;
 export const PSEUDO_INPUT_ASSOCIATION_MS = 160;
-export const PSEUDO_MOVE_WINDOW_MS = 1_500;
 export const PSEUDO_MIN_REWRITES = 2;
 
 const COMPAT_LEADS = [
@@ -229,15 +221,15 @@ function naturalBoundaryKey(key: string): boolean {
 }
 
 function languageSwitchKey(key: string): boolean {
-  return ["HangulMode", "HanjaMode", "Lang1", "Lang2", "ModeChange"].includes(key);
+  return ["HangulMode", "HanjaMode", "Lang1", "Lang2", "ModeChange", "CapsLock"].includes(key);
 }
 
 /**
  * Tracks iOS Korean's composition-less deleteBackward/insertText rewrites.
  * It only becomes reset/repair eligible after two consecutive rewrites of the
- * exact active tail. Ambiguous input is left alone, except that once a stale
- * destructive delete is proven, the matching untrusted insert is suppressed
- * so the original document character remains intact.
+ * exact active tail. Once a stale destructive delete is proven, the original
+ * document character is preserved and an underivable stale insertion falls
+ * back only to the trusted single Korean key that initiated the pair.
  */
 export class KoreanPseudoCompositionStateMachine {
   private active = false;
@@ -253,6 +245,25 @@ export class KoreanPseudoCompositionStateMachine {
 
   onRealCompositionEvent(): void {
     this.clear();
+  }
+
+  onExternalFocusBoundary(): void {
+    this.clear();
+  }
+
+  /**
+   * A plugin-initiated blur/focus is only a reset candidate. Stop using the
+   * old tail to arm new guards, but retain an already moved guard until the
+   * first post-reset input proves whether native state was actually cleared.
+   */
+  onResetSuccessCandidate(): void {
+    this.active = false;
+    this.lastRange = undefined;
+    this.lastText = "";
+    this.lastRewriteTime = 0;
+    this.rewriteCount = 0;
+    this.pendingDelete = undefined;
+    this.pendingStaleDelete = undefined;
   }
 
   onKeyDown(signal: KeySignal): void {
@@ -303,12 +314,11 @@ export class KoreanPseudoCompositionStateMachine {
 
     if (
       this.moved &&
-      signal.at - this.moved.movedAt <= PSEUDO_MOVE_WINDOW_MS &&
       sameSelection(signal.before, this.moved.destination)
     ) {
       this.moved.destination = signal.after;
-      this.moved.movedAt = signal.at;
-      this.moved.origin = signal.origin;
+      this.moved.intended = undefined;
+      this.pendingStaleDelete = undefined;
       return true;
     }
 
@@ -319,7 +329,6 @@ export class KoreanPseudoCompositionStateMachine {
       !collapsed(signal.before) ||
       signal.before.to !== this.lastRange.to ||
       signal.after.to === this.lastRange.to ||
-      signal.at - this.lastRewriteTime > PSEUDO_MOVE_WINDOW_MS ||
       !signal.textBeforeCursor.endsWith(this.lastText)
     ) {
       this.moved = undefined;
@@ -330,8 +339,6 @@ export class KoreanPseudoCompositionStateMachine {
       sourceRange: { ...this.lastRange },
       sourceText: this.lastText,
       destination: signal.after,
-      movedAt: signal.at,
-      origin: signal.origin,
     };
     this.pendingDelete = undefined;
     this.pendingStaleDelete = undefined;
@@ -372,7 +379,7 @@ export class KoreanPseudoCompositionStateMachine {
     }
   }
 
-  commitAtomicRepair(decision: AtomicRepairDecision, at: number): void {
+  commitAtomicRepair(decision: AtomicRepairDecision): void {
     const moved = this.moved;
     if (!moved) return;
     const replacedLength = decision.replace.to - decision.replace.from;
@@ -394,7 +401,6 @@ export class KoreanPseudoCompositionStateMachine {
       from: moved.intended.range.to,
       to: moved.intended.range.to,
     };
-    moved.movedAt = at;
     this.pendingStaleDelete = undefined;
   }
 
@@ -432,7 +438,7 @@ export class KoreanPseudoCompositionStateMachine {
       !keydown.metaKey &&
       recent(signal.at, keydown.at, PSEUDO_INPUT_ASSOCIATION_MS);
 
-    if (this.moved && signal.at - this.moved.movedAt <= PSEUDO_MOVE_WINDOW_MS) {
+    if (this.moved) {
       const expectedRange = this.moved.intended?.range;
       const atDestination = sameSelection(signal.selectionBefore, this.moved.destination);
       const exactContinuationDelete = expectedRange
@@ -514,15 +520,6 @@ export class KoreanPseudoCompositionStateMachine {
         pending.intendedKey,
         signal.insert,
       );
-      if (!intended) {
-        this.pendingStaleDelete = undefined;
-        return {
-          kind: "suppress-stale-insert",
-          reason: "intended-text-not-provable",
-          staleText: this.moved.sourceText,
-        };
-      }
-
       const replace = this.moved.intended?.range ?? {
         from: this.moved.destination.from,
         to: this.moved.destination.to,
@@ -530,10 +527,11 @@ export class KoreanPseudoCompositionStateMachine {
       this.pendingStaleDelete = undefined;
       return {
         kind: "atomic-repair",
-        insert: intended,
+        insert: intended ?? pending.intendedKey,
         replace,
         staleText: this.moved.sourceText,
         originalText: pending.originalText,
+        source: intended ? "derived" : "pending-intended-key",
       };
     }
 

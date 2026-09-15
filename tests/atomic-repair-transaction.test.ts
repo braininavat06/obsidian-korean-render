@@ -1,7 +1,11 @@
 import { EditorSelection, EditorState, Transaction } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
-import { createAtomicRepairTransaction, imeSuppression } from "../src/editor-extension";
+import {
+  createAtomicRepairTransaction,
+  createSelectionRestoreTransaction,
+  imeSuppression,
+} from "../src/editor-extension";
 import type { AtomicRepairDecision } from "../src/pseudo-composition-state-machine";
 
 function repair(insert: string, from: number, to: number, originalText: string): AtomicRepairDecision {
@@ -11,6 +15,7 @@ function repair(insert: string, from: number, to: number, originalText: string):
     replace: { from, to },
     staleText: "휴",
     originalText,
+    source: "derived",
   };
 }
 
@@ -46,5 +51,32 @@ describe("atomic repair transaction", () => {
     const inverse = transaction.changes.invert(transaction.startState.doc);
     const undone = transaction.state.update({ changes: inverse });
     expect(undone.newDoc.toString()).toBe("랜더링");
+  });
+
+  it("preserves every existing character when falling back to a pending intended key", () => {
+    const state = EditorState.create({ doc: "이놈", selection: EditorSelection.cursor(1) });
+    const decision: AtomicRepairDecision = {
+      ...repair("ㅁ", 1, 1, "이"),
+      source: "pending-intended-key",
+    };
+    const transaction = createAtomicRepairTransaction(state, decision);
+
+    expect(transaction.newDoc.toString()).toBe("이ㅁ놈");
+    expect(transaction.annotation(Transaction.userEvent)).toBe("input.type");
+    expect(transaction.annotation(Transaction.addToHistory)).not.toBe(false);
+  });
+
+  it("restores a reset-changed selection without document or history changes", () => {
+    const state = EditorState.create({
+      doc: "가나다",
+      selection: EditorSelection.cursor(0),
+    });
+    const transaction = createSelectionRestoreTransaction(state, EditorSelection.single(2));
+
+    expect(transaction.docChanged).toBe(false);
+    expect(transaction.newDoc.toString()).toBe("가나다");
+    expect(transaction.newSelection.main.from).toBe(2);
+    expect(transaction.annotation(Transaction.addToHistory)).toBe(false);
+    expect(transaction.annotation(imeSuppression)).toBe("experimental-ime-reset-selection-restore");
   });
 });

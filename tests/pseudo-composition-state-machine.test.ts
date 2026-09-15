@@ -224,9 +224,10 @@ describe("KoreanPseudoCompositionStateMachine", () => {
       replace: { from: 3, to: 3 },
       staleText: "휴",
       originalText: "더",
+      source: "derived",
     });
     if (firstRepair.kind !== "atomic-repair") throw new Error("expected repair");
-    machine.commitAtomicRepair(firstRepair, 74);
+    machine.commitAtomicRepair(firstRepair);
     expect(machine.getSourceGuard()).toEqual({ range: { from: 9, to: 10 }, text: "휴" });
 
     expect(staleDelete(machine, 80, 4, "ㅣ", "ㅇ")).toMatchObject({
@@ -241,6 +242,7 @@ describe("KoreanPseudoCompositionStateMachine", () => {
       replace: { from: 3, to: 4 },
       staleText: "휴",
       originalText: "ㅇ",
+      source: "derived",
     });
   });
 
@@ -263,7 +265,7 @@ describe("KoreanPseudoCompositionStateMachine", () => {
     expect(machine.evaluate(transaction(72, 3, 3, value, "", cursor(3)))).toEqual({ kind: "allow" });
   });
 
-  it.each(["HangulMode", "Lang1", "ModeChange"])("ends pseudo state for language switch key %s", (value) => {
+  it.each(["HangulMode", "Lang1", "ModeChange", "CapsLock"])("ends pseudo state for language switch key %s", (value) => {
     const machine = new KoreanPseudoCompositionStateMachine();
     trainEhyu(machine);
     move(machine);
@@ -320,17 +322,84 @@ describe("KoreanPseudoCompositionStateMachine", () => {
     expect(machine.onSelectionMove({ at: 40, before: cursor(start + 1), after: cursor(20), origin: "select.pointer", textBeforeCursor: "embed]]각" })).toBe(true);
   });
 
-  it("aborts rather than guessing when stale insertion cannot prove intended text", () => {
+  it("preserves a trusted pending Korean key when stale insertion cannot be derived", () => {
     const machine = new KoreanPseudoCompositionStateMachine();
     trainEhyu(machine);
     move(machine);
     expect(staleDelete(machine, 70, 3, "ㅇ").kind).toBe("suppress-stale-delete");
     beforeInsert(machine, 73, "가");
-    expect(machine.evaluate(transaction(74, 3, 3, "가", "", cursor(3)))).toEqual({
-      kind: "suppress-stale-insert",
-      reason: "intended-text-not-provable",
+    const firstRepair = machine.evaluate(transaction(74, 3, 3, "가", "", cursor(3)));
+    expect(firstRepair).toEqual({
+      kind: "atomic-repair",
+      insert: "ㅇ",
+      replace: { from: 3, to: 3 },
       staleText: "휴",
+      originalText: "더",
+      source: "pending-intended-key",
     });
+    if (firstRepair.kind !== "atomic-repair") throw new Error("expected repair");
+    machine.commitAtomicRepair(firstRepair);
+
+    expect(staleDelete(machine, 80, 4, "ㅣ", "ㅇ").kind).toBe("suppress-stale-delete");
+    beforeInsert(machine, 83, "휴이");
+    expect(machine.evaluate(transaction(84, 3, 3, "휴이", "", cursor(4)))).toMatchObject({
+      kind: "atomic-repair",
+      insert: "이",
+      replace: { from: 3, to: 4 },
+      source: "derived",
+    });
+  });
+
+  it("keeps a confirmed moved guard beyond 1.5 seconds until an explicit boundary", () => {
+    const machine = new KoreanPseudoCompositionStateMachine();
+    trainEhyu(machine);
+    expect(move(machine, 11_060)).toBe(true);
+    expect(staleDelete(machine, 11_070, 3, "ㅇ").kind).toBe("suppress-stale-delete");
+  });
+
+  it("discards the old intended range when selection moves again after a repair", () => {
+    const machine = new KoreanPseudoCompositionStateMachine();
+    trainEhyu(machine);
+    move(machine);
+    expect(staleDelete(machine, 70, 3, "ㅇ").kind).toBe("suppress-stale-delete");
+    beforeInsert(machine, 73, "흉");
+    const repair = machine.evaluate(transaction(74, 3, 3, "흉", "", cursor(3)));
+    if (repair.kind !== "atomic-repair") throw new Error("expected repair");
+    machine.commitAtomicRepair(repair);
+
+    expect(machine.onSelectionMove({
+      at: 2_500,
+      before: cursor(4),
+      after: cursor(2),
+      origin: "select",
+      textBeforeCursor: "1234567에휴",
+    })).toBe(true);
+    expect(staleDelete(machine, 12_000, 2, "ㅁ", "나")).toMatchObject({
+      kind: "suppress-stale-delete",
+      originalText: "나",
+    });
+  });
+
+  it("retains a moved guard across a reset candidate but clears the old active tail", () => {
+    const machine = new KoreanPseudoCompositionStateMachine();
+    trainEhyu(machine);
+    move(machine);
+    machine.onResetSuccessCandidate();
+
+    expect(machine.getDebugSnapshot().pseudoComposition.active).toBe(false);
+    expect(machine.getDebugSnapshot().selectionMovedOutsidePseudoRange).toBe(true);
+    expect(staleDelete(machine, 5_000, 3, "ㅇ").kind).toBe("suppress-stale-delete");
+  });
+
+  it("ends the session on an external focus boundary", () => {
+    const machine = new KoreanPseudoCompositionStateMachine();
+    trainEhyu(machine);
+    move(machine);
+    machine.onExternalFocusBoundary();
+
+    expect(machine.getDebugSnapshot().pseudoComposition.active).toBe(false);
+    expect(machine.getDebugSnapshot().selectionMovedOutsidePseudoRange).toBe(false);
+    expect(staleDelete(machine, 5_000, 3, "ㅇ").kind).toBe("allow");
   });
 
   it("rejects slow pairs, adjacent ranges, non-input transactions, and missing source text", () => {
