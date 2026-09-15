@@ -1,4 +1,11 @@
-import { Annotation, Prec, Transaction, type Extension } from "@codemirror/state";
+import {
+  Annotation,
+  EditorSelection,
+  Prec,
+  Transaction,
+  type EditorState,
+  type Extension,
+} from "@codemirror/state";
 import { EditorView, ViewPlugin, type ViewUpdate } from "@codemirror/view";
 
 import { snippet, type DebugEntry, type DebugRingBuffer } from "./debug-log";
@@ -7,6 +14,12 @@ import {
   type SelectionOrigin,
   type SelectionSnapshot,
 } from "./ime-state-machine";
+import {
+  KoreanPseudoCompositionStateMachine,
+  type AtomicRepairDecision,
+  type PseudoDecision,
+  type PseudoTransactionSignal,
+} from "./pseudo-composition-state-machine";
 
 export interface ExtensionController {
   isFixEnabled(): boolean;
@@ -37,6 +50,7 @@ function selectionOrigin(userEvent: string | undefined): SelectionOrigin {
 
 class KoreanImeViewTracker {
   readonly machine = new KoreanImeStateMachine();
+  readonly pseudo = new KoreanPseudoCompositionStateMachine();
   private readonly listeners: Array<[string, EventListener]> = [];
 
   constructor(
@@ -50,6 +64,7 @@ class KoreanImeViewTracker {
       "beforeinput",
       "input",
       "keydown",
+      "touchstart",
     ]) {
       const listener: EventListener = (event) => this.onDomEvent(event);
       view.contentDOM.addEventListener(type, listener, { capture: true });
@@ -63,20 +78,30 @@ class KoreanImeViewTracker {
     if (this.controller.isFixEnabled() && update.selectionSet && !update.docChanged) {
       const before = update.startState.selection.main;
       const after = update.state.selection.main;
-      this.machine.onSelectionMove({
+      const move = {
         at: Date.now(),
         before: { from: before.from, to: before.to },
         after: { from: after.from, to: after.to },
         origin: selectionOrigin(userEvent),
-        textBeforeCursor: update.state.sliceDoc(Math.max(0, before.to - 8), before.to),
-      });
+        textBeforeCursor: update.startState.sliceDoc(Math.max(0, before.to - 8), before.to),
+      } as const;
+      this.machine.onSelectionMove(move);
+      if (this.pseudo.onSelectionMove(move)) {
+        this.logDiagnostic("reset-attempt", {
+          "reset-method": "none-safe-public-api",
+          "reset-result": "unavailable-atomic-guard-armed",
+        });
+      }
     }
 
     if (this.controller.isFixEnabled()) {
       for (const transaction of update.transactions) {
-        this.machine.onTransaction(
-          transaction.annotation(Transaction.userEvent),
+        const transactionUserEvent = transaction.annotation(Transaction.userEvent);
+        this.machine.onTransaction(transactionUserEvent, transaction.docChanged);
+        this.pseudo.onDocumentTransaction(
+          transactionUserEvent,
           transaction.docChanged,
+          transaction.annotation(imeSuppression) === "pseudo-atomic-repair",
         );
       }
     }
@@ -99,6 +124,7 @@ class KoreanImeViewTracker {
           docChanged: update.docChanged,
           cmComposing: update.view.composing,
           cmCompositionStarted: update.view.compositionStarted,
+          ...this.pseudo.getDebugSnapshot(),
         },
       });
     }
@@ -121,22 +147,31 @@ class KoreanImeViewTracker {
         details: {
           cmComposing: update.view.composing,
           cmCompositionStarted: update.view.compositionStarted,
+          ...this.pseudo.getDebugSnapshot(),
         },
       });
     }
   }
 
   logSuppression(reason: string, inserted: string, from: number): void {
+    this.logDiagnostic("workaround-suppressed-input", {
+      reason,
+      insertionFrom: from,
+      data: inserted,
+    });
+  }
+
+  logDiagnostic(eventType: string, details: Record<string, unknown>): void {
     if (!this.controller.isDebugEnabled()) return;
     const current = snippet(this.view.state.doc, this.view.state.selection);
+    const selection = selectionSnapshot(this.view);
     this.controller.debugLog.create({
-      eventType: "workaround-suppressed-input",
-      data: inserted,
-      selectionFrom: this.view.state.selection.main.from,
-      selectionTo: this.view.state.selection.main.to,
+      eventType,
+      selectionFrom: selection.from,
+      selectionTo: selection.to,
       before: current,
       after: current,
-      details: { reason, insertionFrom: from },
+      details: { ...details, ...this.pseudo.getDebugSnapshot() },
     });
   }
 
@@ -157,12 +192,15 @@ class KoreanImeViewTracker {
     if (this.controller.isFixEnabled()) {
       switch (event.type) {
         case "compositionstart":
+          this.pseudo.onRealCompositionEvent();
           this.machine.onCompositionStart();
           break;
         case "compositionupdate":
+          this.pseudo.onRealCompositionEvent();
           this.machine.onCompositionUpdate(compositionEvent.data ?? "");
           break;
         case "compositionend":
+          this.pseudo.onRealCompositionEvent();
           this.machine.onCompositionEnd(compositionEvent.data ?? "");
           break;
         case "beforeinput":
@@ -172,12 +210,33 @@ class KoreanImeViewTracker {
             inputType: inputEvent.inputType,
             isComposing: inputEvent.isComposing,
           });
+          this.pseudo.onBeforeInput({
+            at: now,
+            data: inputEvent.data,
+            inputType: inputEvent.inputType,
+            isComposing: inputEvent.isComposing || this.view.composing,
+          });
           break;
         case "keydown":
           this.machine.onKeyDown({
             at: now,
             key: keyboardEvent.key,
             isComposing: keyboardEvent.isComposing,
+            altKey: keyboardEvent.altKey,
+            ctrlKey: keyboardEvent.ctrlKey,
+            metaKey: keyboardEvent.metaKey,
+            shiftKey: keyboardEvent.shiftKey,
+            repeat: keyboardEvent.repeat,
+          });
+          this.pseudo.onKeyDown({
+            at: now,
+            key: keyboardEvent.key,
+            isComposing: keyboardEvent.isComposing || this.view.composing,
+            altKey: keyboardEvent.altKey,
+            ctrlKey: keyboardEvent.ctrlKey,
+            metaKey: keyboardEvent.metaKey,
+            shiftKey: keyboardEvent.shiftKey,
+            repeat: keyboardEvent.repeat,
           });
           break;
       }
@@ -208,6 +267,16 @@ class KoreanImeViewTracker {
       details: {
         cmComposing: this.view.composing,
         cmCompositionStarted: this.view.compositionStarted,
+        ...(event.type === "keydown"
+          ? {
+              altKey: keyboardEvent.altKey,
+              ctrlKey: keyboardEvent.ctrlKey,
+              metaKey: keyboardEvent.metaKey,
+              shiftKey: keyboardEvent.shiftKey,
+              repeat: keyboardEvent.repeat,
+            }
+          : {}),
+        ...this.pseudo.getDebugSnapshot(),
       },
     });
 
@@ -220,6 +289,86 @@ class KoreanImeViewTracker {
   }
 }
 
+function dispatchNoDocumentChange(view: EditorView, reason: string): void {
+  view.dispatch({
+    selection: view.state.selection,
+    annotations: [Transaction.addToHistory.of(false), imeSuppression.of(reason)],
+  });
+}
+
+export function createAtomicRepairTransaction(
+  state: EditorState,
+  decision: AtomicRepairDecision,
+): Transaction {
+  return state.update({
+    changes: {
+      from: decision.replace.from,
+      to: decision.replace.to,
+      insert: decision.insert,
+    },
+    selection: EditorSelection.cursor(decision.replace.from + decision.insert.length),
+    annotations: [
+      Transaction.userEvent.of("input.type"),
+      imeSuppression.of("pseudo-atomic-repair"),
+    ],
+  });
+}
+
+function applyPseudoDecision(
+  view: EditorView,
+  tracker: KoreanImeViewTracker,
+  decision: PseudoDecision,
+): boolean {
+  if (decision.kind === "allow") return false;
+
+  if (decision.kind === "suppress-stale-delete") {
+    tracker.logDiagnostic("stale-rewrite-detected", {
+      stage: "deleteContentBackward",
+      deletedText: decision.originalText,
+      staleText: decision.staleText,
+      range: decision.range,
+    });
+    tracker.logDiagnostic("stale-rewrite-suppressed", { stage: "destructive-delete" });
+    dispatchNoDocumentChange(view, "pseudo-stale-delete");
+    return true;
+  }
+
+  if (decision.kind === "suppress-stale-insert") {
+    tracker.logDiagnostic("repair-aborted", {
+      reason: decision.reason,
+      staleText: decision.staleText,
+    });
+    tracker.logDiagnostic("stale-rewrite-suppressed", { stage: "unprovable-insert" });
+    dispatchNoDocumentChange(view, "pseudo-stale-insert-unprovable");
+    return true;
+  }
+
+  if (
+    decision.replace.from < 0 ||
+    decision.replace.to < decision.replace.from ||
+    decision.replace.to > view.state.doc.length
+  ) {
+    tracker.logDiagnostic("repair-aborted", { reason: "repair-range-invalid" });
+    dispatchNoDocumentChange(view, "pseudo-repair-range-invalid");
+    return true;
+  }
+
+  tracker.logDiagnostic("stale-rewrite-detected", {
+    stage: "insertText",
+    staleText: decision.staleText,
+  });
+  tracker.pseudo.commitAtomicRepair(decision, Date.now());
+  view.dispatch(createAtomicRepairTransaction(view.state, decision));
+  tracker.logDiagnostic("atomic-repair", {
+    restoredOriginalText: decision.originalText,
+    discardedStaleText: decision.staleText,
+    insertedTrustedText: decision.insert,
+    replace: decision.replace,
+  });
+  tracker.logDiagnostic("stale-rewrite-suppressed", { stage: "atomic-repair" });
+  return true;
+}
+
 export function createKoreanImeEditorExtension(controller: ExtensionController): Extension {
   const trackerPlugin: ViewPlugin<KoreanImeViewTracker> = ViewPlugin.define(
     (view) => new KoreanImeViewTracker(view, controller),
@@ -229,8 +378,7 @@ export function createKoreanImeEditorExtension(controller: ExtensionController):
     if (!controller.isFixEnabled()) return false;
 
     const tracker = view.plugin(trackerPlugin);
-    const moved = tracker?.machine.getMovedComposition();
-    if (!tracker || !moved) return false;
+    if (!tracker) return false;
 
     const transaction = defaultInsert();
     let changeCount = 0;
@@ -244,33 +392,52 @@ export function createKoreanImeEditorExtension(controller: ExtensionController):
       transactionInsert = inserted.toString();
     });
 
-    const sourceStillPresent =
-      moved.sourceFrom >= 0 &&
-      moved.sourceTo <= view.state.doc.length &&
-      view.state.sliceDoc(moved.sourceFrom, moved.sourceTo) === moved.text;
     const main = view.state.selection.main;
-    const decision = tracker.machine.evaluate({
+    const realMoved = tracker.machine.getMovedComposition();
+    if (realMoved) {
+      const sourceStillPresent =
+        realMoved.sourceFrom >= 0 &&
+        realMoved.sourceTo <= view.state.doc.length &&
+        view.state.sliceDoc(realMoved.sourceFrom, realMoved.sourceTo) === realMoved.text;
+      const decision = tracker.machine.evaluate({
+        at: Date.now(),
+        from: transactionFrom,
+        to: transactionTo,
+        insert: transactionInsert,
+        changeCount,
+        userEvent: transaction.annotation(Transaction.userEvent),
+        selectionBefore: { from: main.from, to: main.to },
+        sourceStillPresent,
+      });
+
+      if (decision.suppress) {
+        tracker.logSuppression(decision.reason ?? "unknown", text, from);
+        dispatchNoDocumentChange(view, decision.reason ?? "unknown");
+        return true;
+      }
+    }
+
+    const source = tracker.pseudo.getSourceGuard();
+    const sourceStillPresent =
+      source === undefined ||
+      (source.range.from >= 0 &&
+        source.range.to <= view.state.doc.length &&
+        view.state.sliceDoc(source.range.from, source.range.to) === source.text);
+    const pseudoSignal: PseudoTransactionSignal = {
       at: Date.now(),
       from: transactionFrom,
       to: transactionTo,
       insert: transactionInsert,
+      deletedText:
+        transactionFrom >= 0 && transactionTo >= transactionFrom
+          ? view.state.sliceDoc(transactionFrom, transactionTo)
+          : "",
       changeCount,
       userEvent: transaction.annotation(Transaction.userEvent),
       selectionBefore: { from: main.from, to: main.to },
       sourceStillPresent,
-    });
-
-    if (!decision.suppress) return false;
-
-    tracker.logSuppression(decision.reason ?? "unknown", text, from);
-    view.dispatch({
-      selection: view.state.selection,
-      annotations: [
-        Transaction.addToHistory.of(false),
-        imeSuppression.of(decision.reason ?? "unknown"),
-      ],
-    });
-    return true;
+    };
+    return applyPseudoDecision(view, tracker, tracker.pseudo.evaluate(pseudoSignal));
   });
 
   return [Prec.highest(inputHandler), trackerPlugin];

@@ -16,6 +16,11 @@ export interface KeySignal {
   at: number;
   key: string;
   isComposing: boolean;
+  altKey?: boolean;
+  ctrlKey?: boolean;
+  metaKey?: boolean;
+  shiftKey?: boolean;
+  repeat?: boolean;
 }
 
 export interface SelectionMoveSignal {

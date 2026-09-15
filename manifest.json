@@ -1,9 +1,9 @@
 {
   "id": "korean-render",
   "name": "Korean Render",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.5.0",
-  "description": "A conservative iOS workaround and diagnostic logger for stale Korean IME composition text in Live Preview.",
+  "description": "A conservative iOS workaround for destructive stale Korean IME rewrites in Live Preview.",
   "author": "Korean Render contributors",
   "isDesktopOnly": false
 }
