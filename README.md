@@ -156,7 +156,9 @@ dist/korean-render/          → <Vault>/.obsidian/plugins/korean-render/
   manifest.json
 ```
 
-Settings에는 **Enable Korean Render**(기본 ON)와 **Debug logging**(기본 OFF)만 있습니다.
+Settings에는 **Enable Korean Render**(기본 ON)와 **Debug logging**(기본 OFF)이 있습니다.
+Debug logging을 OFF에서 ON으로 켜면 이전 session의 in-memory log를 먼저 비웁니다.
+Command Palette의 **Korean Render: Clear debug log**는 ring buffer만 즉시 비우며 document와 pseudo-composition state는 변경하지 않습니다. **Copy debug log**는 복사 뒤 log를 자동 삭제하지 않습니다.
 
 ## 실제 iPadOS 검증 절차
 

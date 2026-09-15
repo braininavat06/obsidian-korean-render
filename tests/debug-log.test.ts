@@ -31,4 +31,38 @@ describe("debug log privacy bounds", () => {
     expect(output).not.toContain("vaultPath");
     expect(output).not.toContain("noteTitle");
   });
+
+  it("clears only the in-memory entries immediately", () => {
+    const log = new DebugRingBuffer(2);
+    log.create({
+      eventType: "beforeinput",
+      selectionFrom: 1,
+      selectionTo: 1,
+      before: { from: 0, to: 1, text: "가" },
+      after: { from: 0, to: 1, text: "가" },
+    });
+    expect(log.size).toBe(1);
+
+    log.clear();
+
+    expect(log.size).toBe(0);
+    expect(log.export({ pluginVersion: "0.1.1" }).split("\n")).toHaveLength(1);
+  });
+
+  it("does not clear entries when the same log is exported repeatedly", () => {
+    const log = new DebugRingBuffer(2);
+    log.create({
+      eventType: "input",
+      selectionFrom: 1,
+      selectionTo: 1,
+      before: { from: 0, to: 1, text: "한" },
+      after: { from: 0, to: 1, text: "한" },
+    });
+
+    const first = log.export({ pluginVersion: "0.1.1" });
+    const second = log.export({ pluginVersion: "0.1.1" });
+
+    expect(second).toBe(first);
+    expect(log.size).toBe(1);
+  });
 });

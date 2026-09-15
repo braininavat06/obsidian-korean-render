@@ -40,6 +40,14 @@ export default class KoreanImeFixPlugin extends Plugin implements ExtensionContr
         void this.copyDebugLog();
       },
     });
+    this.addCommand({
+      id: "clear-debug-log",
+      name: "Korean Render: Clear debug log",
+      callback: () => {
+        this.debugLog.clear();
+        new Notice("Korean Render: debug log cleared.");
+      },
+    });
   }
 
   isFixEnabled(): boolean {
@@ -51,8 +59,11 @@ export default class KoreanImeFixPlugin extends Plugin implements ExtensionContr
   }
 
   async updateSettings(next: Partial<KoreanImeFixSettings>): Promise<void> {
+    const debugLoggingChanged =
+      typeof next.debugLogging === "boolean" &&
+      next.debugLogging !== this.settings.debugLogging;
     Object.assign(this.settings, next);
-    if (!this.settings.debugLogging) this.debugLog.clear();
+    if (debugLoggingChanged || !this.settings.debugLogging) this.debugLog.clear();
     await this.saveData(this.settings);
   }
 

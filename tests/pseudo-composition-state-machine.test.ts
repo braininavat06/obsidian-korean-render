@@ -134,6 +134,30 @@ function staleDelete(
 }
 
 describe("KoreanPseudoCompositionStateMachine", () => {
+  it("the first tracked rewrite replaces only text inserted by the IME", () => {
+    const machine = new KoreanPseudoCompositionStateMachine();
+    let document = "ABC";
+
+    initialInsert(machine, 10, 3, "ㄱ");
+    document = `${document}ㄱ`;
+
+    key(machine, 20, "ㅏ");
+    beforeDelete(machine, 21);
+    const deleteDecision = machine.evaluate(
+      transaction(22, 3, 4, "", document.slice(3, 4), cursor(4)),
+    );
+    expect(deleteDecision).toEqual({ kind: "allow" });
+    expect(document.slice(3, 4)).toBe("ㄱ");
+    expect(document.slice(0, 3)).toBe("ABC");
+    document = document.slice(0, 3);
+
+    beforeInsert(machine, 23, "가");
+    expect(machine.evaluate(transaction(24, 3, 3, "가", "", cursor(3)))).toEqual({ kind: "allow" });
+    document = `${document}가`;
+
+    expect(document).toBe("ABC가");
+  });
+
   it("tracks 가 → 각 → 간 style rewrites without intervening", () => {
     const machine = new KoreanPseudoCompositionStateMachine();
     initialInsert(machine, 10, 0, "ㄱ");
