@@ -364,11 +364,21 @@ function applyPseudoDecision(
   if (decision.kind === "allow") return false;
 
   if (decision.kind === "suppress-stale-delete") {
+    if (decision.deleteSource === "shifted-native-tail") {
+      tracker.logDiagnostic("shifted-native-tail-delete-detected", {
+        attemptedRange: decision.range,
+        repairRange: decision.repairRange,
+        deletedText: decision.originalText,
+        nativeTailText: decision.staleText,
+      });
+    }
     tracker.logDiagnostic("stale-rewrite-detected", {
       stage: "deleteContentBackward",
       deletedText: decision.originalText,
       staleText: decision.staleText,
       range: decision.range,
+      repairRange: decision.repairRange,
+      deleteSource: decision.deleteSource,
     });
     tracker.logDiagnostic("stale-rewrite-suppressed", { stage: "destructive-delete" });
     dispatchNoDocumentChange(view, "pseudo-stale-delete");
@@ -484,8 +494,13 @@ export function createKoreanImeEditorExtension(controller: ExtensionController):
           ? view.state.sliceDoc(transactionFrom, transactionTo)
           : "",
       changeCount,
+      docChanged: transaction.docChanged,
       userEvent: transaction.annotation(Transaction.userEvent),
       selectionBefore: { from: main.from, to: main.to },
+      selectionAfter: {
+        from: transaction.newSelection.main.from,
+        to: transaction.newSelection.main.to,
+      },
       sourceStillPresent,
     };
     const pseudoDecision = tracker.pseudo.evaluate(pseudoSignal);

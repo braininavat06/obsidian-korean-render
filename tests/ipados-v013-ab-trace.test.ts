@@ -30,8 +30,10 @@ function signal(
     insert,
     deletedText,
     changeCount: 1,
+    docChanged: true,
     userEvent: "input.type",
     selectionBefore: cursor(position),
+    selectionAfter: cursor(position),
     sourceStillPresent,
   };
 }

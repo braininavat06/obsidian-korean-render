@@ -26,8 +26,10 @@ function transaction(
     insert,
     deletedText,
     changeCount: 1,
+    docChanged: true,
     userEvent: "input.type",
     selectionBefore,
+    selectionAfter: selectionBefore,
     sourceStillPresent: true,
     ...overrides,
   };

@@ -30,8 +30,10 @@ function transaction(
     insert,
     deletedText,
     changeCount: 1,
+    docChanged: true,
     userEvent,
     selectionBefore: cursor(position),
+    selectionAfter: cursor(position),
     sourceStillPresent: true,
   };
 }
@@ -263,7 +265,7 @@ describe("anonymized iPadOS v0.1.4 regression traces", () => {
     });
     expect(machine.getDebugSnapshot().pendingPostDeleteReplayGuard).toBeNull();
     const suppressed = machine.drainDiagnostics().find(
-      (diagnostic) => diagnostic.eventType === "post-delete-replay-guard-disarmed",
+      (diagnostic) => diagnostic.eventType === "post-delete-guard-disarmed",
     );
     expect(suppressed?.details["reason"]).toBe("suppressed-one-shot");
   });
@@ -274,7 +276,7 @@ describe("anonymized iPadOS v0.1.4 regression traces", () => {
     machine.drainDiagnostics();
     key(machine, 120, "ㄱ", cursor(0));
     const disarmed = machine.drainDiagnostics().find(
-      (diagnostic) => diagnostic.eventType === "post-delete-replay-guard-disarmed",
+      (diagnostic) => diagnostic.eventType === "post-delete-guard-disarmed",
     );
     expect(disarmed?.details["reason"]).toBe("korean-keydown");
     beforeInsert(machine, 121, "ㄱ");

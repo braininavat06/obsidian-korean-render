@@ -17,8 +17,10 @@ export interface PseudoTransactionSignal {
   insert: string;
   deletedText: string;
   changeCount: number;
+  docChanged: boolean;
   userEvent: string | undefined;
   selectionBefore: SelectionSnapshot;
+  selectionAfter: SelectionSnapshot;
   sourceStillPresent: boolean;
 }
 
@@ -40,7 +42,9 @@ export type PseudoDecision =
       kind: "suppress-stale-delete";
       originalText: string;
       range: TextRange;
+      repairRange: TextRange;
       staleText: string;
+      deleteSource: "exact-continuation" | "shifted-native-tail";
     }
   | {
       kind: "atomic-repair";
@@ -97,8 +101,10 @@ interface PendingDelete {
 interface PendingStaleDelete {
   at: number;
   originalText: string;
-  range: TextRange;
+  attemptedRange: TextRange;
+  repairRange: TextRange;
   intendedKey: string;
+  deleteSource: "exact-continuation" | "shifted-native-tail";
 }
 
 interface MovedPseudoComposition {
@@ -125,7 +131,10 @@ interface PendingPostDeleteReplayGuard {
 }
 
 export interface PseudoDiagnostic {
-  eventType: "post-delete-replay-guard-armed" | "post-delete-replay-guard-disarmed";
+  eventType:
+    | "post-delete-replay-guard-armed"
+    | "post-delete-noop-preserved"
+    | "post-delete-guard-disarmed";
   details: Record<string, unknown>;
 }
 
@@ -199,6 +208,10 @@ function collapsed(selection: SelectionSnapshot): boolean {
 
 function sameSelection(a: SelectionSnapshot, b: SelectionSnapshot): boolean {
   return a.from === b.from && a.to === b.to;
+}
+
+function cursorAt(position: number): SelectionSnapshot {
+  return { from: position, to: position };
 }
 
 function sameRange(a: TextRange | undefined, b: TextRange): boolean {
@@ -342,6 +355,7 @@ export class KoreanPseudoCompositionStateMachine {
   private rewriteCount = 0;
   private beforeInput: BeforeInputSignal | undefined;
   private keydown: KeySignal | undefined;
+  private keydownSelection: SelectionSnapshot | undefined;
   private pendingDelete: PendingDelete | undefined;
   private pendingStaleDelete: PendingStaleDelete | undefined;
   private moved: MovedPseudoComposition | undefined;
@@ -386,6 +400,7 @@ export class KoreanPseudoCompositionStateMachine {
       this.pendingSelectionDeleteKey = undefined;
     }
     this.keydown = signal;
+    this.keydownSelection = selection ? { ...selection } : undefined;
     if (signal.isComposing) return;
     if (signal.altKey || signal.ctrlKey || signal.metaKey) {
       this.clearCompositionState();
@@ -482,8 +497,39 @@ export class KoreanPseudoCompositionStateMachine {
 
   evaluate(signal: PseudoTransactionSignal): PseudoDecision {
     this.expirePostDeleteReplayGuard(signal.at);
-    if (signal.changeCount !== 1) {
-      this.disarmPostDeleteReplayGuard("multi-change-transaction");
+    if (signal.changeCount === 0) {
+      const guard = this.pendingPostDeleteReplayGuard;
+      const sameDeleteBurst =
+        guard !== undefined &&
+        !signal.docChanged &&
+        signal.insert === "" &&
+        this.beforeInput?.inputType === "deleteContentBackward" &&
+        recent(signal.at, this.beforeInput.at, PSEUDO_INPUT_ASSOCIATION_MS) &&
+        sameSelection(signal.selectionBefore, guard.destination) &&
+        sameSelection(signal.selectionAfter, guard.destination);
+      if (sameDeleteBurst) {
+        this.diagnostics.push({
+          eventType: "post-delete-noop-preserved",
+          details: {
+            reason: "same-deleteContentBackward-burst",
+            armedAt: guard.armedAt,
+            destination: { ...guard.destination },
+          },
+        });
+      } else if (guard) {
+        this.disarmPostDeleteReplayGuard(
+          !sameSelection(signal.selectionBefore, signal.selectionAfter) ||
+            !sameSelection(signal.selectionAfter, guard.destination)
+            ? "zero-change-selection-change"
+            : "unrelated-zero-change-transaction",
+        );
+      }
+      this.pendingDelete = undefined;
+      this.pendingStaleDelete = undefined;
+      return { kind: "allow" };
+    }
+    if (signal.changeCount > 1) {
+      this.disarmPostDeleteReplayGuard("multi-change-document-transaction");
       this.pendingDelete = undefined;
       this.pendingStaleDelete = undefined;
       return { kind: "allow" };
@@ -690,27 +736,57 @@ export class KoreanPseudoCompositionStateMachine {
           signal.from < signal.to &&
           oneCodePoint(signal.deletedText) &&
           !sameRange(this.moved.protectedSourceRange, { from: signal.from, to: signal.to });
+      const nativeTailLength = this.moved.nativeTailText.length;
+      const shiftedNativeTailDelete =
+        intended !== undefined &&
+        nativeTailLength > 0 &&
+        sameSelection(this.moved.destination, cursorAt(intended.range.to)) &&
+        sameSelection(signal.selectionBefore, cursorAt(intended.range.to)) &&
+        this.keydownSelection !== undefined &&
+        sameSelection(this.keydownSelection, this.moved.destination) &&
+        this.moved.nativeTailRange.to === intended.range.to &&
+        this.moved.nativeTailRange.from === intended.range.to - nativeTailLength &&
+        intended.text.endsWith(this.moved.nativeTailText) &&
+        signal.from === intended.range.to &&
+        signal.to === intended.range.to + nativeTailLength &&
+        signal.deletedText.length === nativeTailLength &&
+        signal.deletedText === this.moved.nativeTailText &&
+        signal.to <= this.moved.protectedSourceRange.from;
 
       if (
         recentDeleteBeforeInput &&
         recentKoreanKey &&
+        signal.docChanged &&
         inputTypeEvent(signal.userEvent) &&
         atDestination &&
-        exactContinuationDelete &&
+        (exactContinuationDelete || shiftedNativeTailDelete) &&
         signal.sourceStillPresent &&
         !signal.deletedText.includes("\n")
       ) {
+        const deleteSource = shiftedNativeTailDelete
+          ? "shifted-native-tail"
+          : "exact-continuation";
+        const repairRange = shiftedNativeTailDelete
+          ? { ...this.moved.nativeTailRange }
+          : { from: signal.from, to: signal.to };
+        if (shiftedNativeTailDelete) {
+          this.moved.nativeTailRange = { from: signal.from, to: signal.to };
+        }
         this.pendingStaleDelete = {
           at: signal.at,
           originalText: signal.deletedText,
-          range: { from: signal.from, to: signal.to },
+          attemptedRange: { from: signal.from, to: signal.to },
+          repairRange,
           intendedKey: keydown.key,
+          deleteSource,
         };
         return {
           kind: "suppress-stale-delete",
           originalText: signal.deletedText,
           range: { from: signal.from, to: signal.to },
+          repairRange,
           staleText: this.moved.nativeTailText,
+          deleteSource,
         };
       }
 
@@ -793,7 +869,7 @@ export class KoreanPseudoCompositionStateMachine {
         ? this.moved.intended
           ? intended.replaceWholeIntended
             ? this.moved.intended.range
-            : pending.range
+            : pending.repairRange
           : { from: this.moved.destination.from, to: this.moved.destination.to }
         : { from: this.moved.destination.from, to: this.moved.destination.to };
       this.pendingStaleDelete = undefined;
@@ -896,7 +972,7 @@ export class KoreanPseudoCompositionStateMachine {
     if (!guard) return;
     this.pendingPostDeleteReplayGuard = undefined;
     this.diagnostics.push({
-      eventType: "post-delete-replay-guard-disarmed",
+      eventType: "post-delete-guard-disarmed",
       details: {
         reason,
         armedAt: guard.armedAt,
@@ -915,5 +991,6 @@ export class KoreanPseudoCompositionStateMachine {
     this.pendingDelete = undefined;
     this.pendingStaleDelete = undefined;
     this.moved = undefined;
+    this.keydownSelection = undefined;
   }
 }
