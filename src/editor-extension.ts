@@ -89,10 +89,12 @@ class KoreanImeViewTracker {
       } as const;
       this.machine.onSelectionMove(move);
       if (this.pseudo.onSelectionMove(move)) {
+        const snapshot = this.pseudo.getDebugSnapshot();
         this.logDiagnostic("pseudo-moved-guard-armed", {
           origin: move.origin,
           "selection-before": move.before,
           "selection-after": move.after,
+          guardConfidence: snapshot.movedGuard?.guardConfidence ?? null,
         });
       }
     }

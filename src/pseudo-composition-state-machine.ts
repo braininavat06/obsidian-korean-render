@@ -72,6 +72,8 @@ export interface PseudoDebugSnapshot {
     lastText: string;
     lastRewriteTime: number | null;
     rewriteCount: number;
+    guardConfidence: GuardConfidence | null;
+    singleRewriteLineage: SingleRewriteLineageSnapshot | null;
   };
   selectionMovedOutsidePseudoRange: boolean;
   movedGuard: {
@@ -82,6 +84,8 @@ export interface PseudoDebugSnapshot {
     destination: SelectionSnapshot;
     intendedRange: TextRange | null;
     intendedText: string;
+    guardConfidence: GuardConfidence;
+    singleRewriteLineage: SingleRewriteLineageSnapshot | null;
   } | null;
   pendingPostDeleteReplayGuard: {
     armedAt: number;
@@ -96,6 +100,27 @@ interface PendingDelete {
   at: number;
   range: TextRange;
   text: string;
+  initialFragment?: InitialFragmentCandidate;
+}
+
+type GuardConfidence = "multi-rewrite" | "single-confirmed-lineage";
+
+interface InitialFragmentCandidate {
+  insertedAt: number;
+  range: TextRange;
+  text: string;
+  key: string;
+}
+
+interface SingleRewriteLineageSnapshot {
+  initialText: string;
+  initialRange: TextRange;
+  deletedText: string;
+  deletedRange: TextRange;
+  replacementText: string;
+  replacementRange: TextRange;
+  rewriteIntervalMs: number;
+  deleteInsertIntervalMs: number;
 }
 
 interface PendingStaleDelete {
@@ -114,6 +139,8 @@ interface MovedPseudoComposition {
   nativeTailText: string;
   destination: SelectionSnapshot;
   intended?: { range: TextRange; text: string };
+  guardConfidence: GuardConfidence;
+  singleRewriteLineage?: SingleRewriteLineageSnapshot;
 }
 
 interface PendingSelectionDeleteKey {
@@ -134,7 +161,8 @@ export interface PseudoDiagnostic {
   eventType:
     | "post-delete-replay-guard-armed"
     | "post-delete-noop-preserved"
-    | "post-delete-guard-disarmed";
+    | "post-delete-guard-disarmed"
+    | "single-rewrite-lineage-confirmed";
   details: Record<string, unknown>;
 }
 
@@ -220,6 +248,19 @@ function sameRange(a: TextRange | undefined, b: TextRange): boolean {
 
 function oneCodePoint(text: string): boolean {
   return Array.from(text).length === 1;
+}
+
+function isCompatibilityLead(text: string): boolean {
+  return oneCodePoint(text) && COMPAT_LEADS.includes(text as (typeof COMPAT_LEADS)[number]);
+}
+
+function copyLineage(lineage: SingleRewriteLineageSnapshot): SingleRewriteLineageSnapshot {
+  return {
+    ...lineage,
+    initialRange: { ...lineage.initialRange },
+    deletedRange: { ...lineage.deletedRange },
+    replacementRange: { ...lineage.replacementRange },
+  };
 }
 
 export function isHangulText(text: string): boolean {
@@ -342,10 +383,11 @@ function languageSwitchKey(key: string): boolean {
 
 /**
  * Tracks iOS Korean's composition-less deleteBackward/insertText rewrites.
- * It only becomes repair eligible after two consecutive rewrites of the
- * exact active tail. Once a stale destructive delete is proven, the original
- * document character is preserved. An underivable stale insertion appends
- * only the trusted single Korean key instead of overwriting intended text.
+ * It normally becomes repair eligible after two consecutive rewrites of the
+ * exact active tail. A single rewrite qualifies only when an actual Korean
+ * key/initial-fragment insertion, its exact deletion, and its same-range
+ * native syllable replacement form one confirmed lineage. Once a stale
+ * destructive delete is proven, the original document character is preserved.
  */
 export class KoreanPseudoCompositionStateMachine {
   private active = false;
@@ -359,6 +401,8 @@ export class KoreanPseudoCompositionStateMachine {
   private pendingDelete: PendingDelete | undefined;
   private pendingStaleDelete: PendingStaleDelete | undefined;
   private moved: MovedPseudoComposition | undefined;
+  private initialFragmentCandidate: InitialFragmentCandidate | undefined;
+  private singleRewriteLineage: SingleRewriteLineageSnapshot | undefined;
   private pendingSelectionDeleteKey: PendingSelectionDeleteKey | undefined;
   private pendingPostDeleteReplayGuard: PendingPostDeleteReplayGuard | undefined;
   private readonly diagnostics: PseudoDiagnostic[] = [];
@@ -457,6 +501,7 @@ export class KoreanPseudoCompositionStateMachine {
       !collapsed(signal.after)
     ) {
       if (!collapsed(signal.after)) this.clearCompositionState();
+      else if (!sameSelection(signal.before, signal.after)) this.clearSingleRewriteEvidence();
       return false;
     }
 
@@ -470,9 +515,22 @@ export class KoreanPseudoCompositionStateMachine {
       return true;
     }
 
+    const singleRewriteEligible =
+      this.rewriteCount === 1 &&
+      this.singleRewriteLineage !== undefined &&
+      this.lastRange !== undefined &&
+      sameRange(this.lastRange, this.singleRewriteLineage.replacementRange) &&
+      this.lastText === this.singleRewriteLineage.replacementText;
+    const guardConfidence: GuardConfidence | undefined =
+      this.rewriteCount >= PSEUDO_MIN_REWRITES
+        ? "multi-rewrite"
+        : singleRewriteEligible
+          ? "single-confirmed-lineage"
+          : undefined;
+
     if (
       !this.active ||
-      this.rewriteCount < PSEUDO_MIN_REWRITES ||
+      guardConfidence === undefined ||
       !this.lastRange ||
       !collapsed(signal.before) ||
       signal.before.to !== this.lastRange.to ||
@@ -480,6 +538,7 @@ export class KoreanPseudoCompositionStateMachine {
       !signal.textBeforeCursor.endsWith(this.lastText)
     ) {
       this.moved = undefined;
+      this.clearSingleRewriteEvidence();
       return false;
     }
 
@@ -489,7 +548,13 @@ export class KoreanPseudoCompositionStateMachine {
       nativeTailRange: { ...this.lastRange },
       nativeTailText: this.lastText,
       destination: signal.after,
+      guardConfidence,
+      singleRewriteLineage:
+        guardConfidence === "single-confirmed-lineage" && this.singleRewriteLineage
+          ? copyLineage(this.singleRewriteLineage)
+          : undefined,
     };
+    this.initialFragmentCandidate = undefined;
     this.pendingDelete = undefined;
     this.pendingStaleDelete = undefined;
     return true;
@@ -680,6 +745,15 @@ export class KoreanPseudoCompositionStateMachine {
         lastText: this.lastText,
         lastRewriteTime: this.lastRewriteTime || null,
         rewriteCount: this.rewriteCount,
+        guardConfidence:
+          this.rewriteCount >= PSEUDO_MIN_REWRITES
+            ? "multi-rewrite"
+            : this.singleRewriteLineage
+              ? "single-confirmed-lineage"
+              : null,
+        singleRewriteLineage: this.singleRewriteLineage
+          ? copyLineage(this.singleRewriteLineage)
+          : null,
       },
       selectionMovedOutsidePseudoRange: this.moved !== undefined,
       movedGuard: this.moved
@@ -691,6 +765,10 @@ export class KoreanPseudoCompositionStateMachine {
             destination: { ...this.moved.destination },
             intendedRange: this.moved.intended ? { ...this.moved.intended.range } : null,
             intendedText: this.moved.intended?.text ?? "",
+            guardConfidence: this.moved.guardConfidence,
+            singleRewriteLineage: this.moved.singleRewriteLineage
+              ? copyLineage(this.moved.singleRewriteLineage)
+              : null,
           }
         : null,
       pendingPostDeleteReplayGuard: this.pendingPostDeleteReplayGuard
@@ -801,13 +879,28 @@ export class KoreanPseudoCompositionStateMachine {
       signal.deletedText === this.lastText &&
       sameSelection(signal.selectionBefore, { from: signal.to, to: signal.to })
     ) {
+      const candidate = this.initialFragmentCandidate;
+      const exactInitialFragmentDelete =
+        candidate !== undefined &&
+        signal.docChanged &&
+        sameRange(candidate.range, { from: signal.from, to: signal.to }) &&
+        signal.deletedText === candidate.text &&
+        sameSelection(signal.selectionBefore, cursorAt(candidate.range.to)) &&
+        this.keydownSelection !== undefined &&
+        sameSelection(this.keydownSelection, signal.selectionBefore) &&
+        recent(signal.at, candidate.insertedAt, PSEUDO_INPUT_ASSOCIATION_MS);
       this.pendingDelete = {
         at: signal.at,
         range: { from: signal.from, to: signal.to },
         text: signal.deletedText,
+        initialFragment: exactInitialFragmentDelete
+          ? { ...candidate, range: { ...candidate.range } }
+          : undefined,
       };
+      if (!exactInitialFragmentDelete) this.clearSingleRewriteEvidence();
     } else {
       this.pendingDelete = undefined;
+      this.clearSingleRewriteEvidence();
     }
     return { kind: "allow" };
   }
@@ -899,6 +992,19 @@ export class KoreanPseudoCompositionStateMachine {
         this.lastText === pending.text;
       const tail = Array.from(signal.insert).at(-1) ?? "";
       const tailLength = tail.length;
+      const candidate = pending.initialFragment;
+      const replacementRange = {
+        from: signal.from,
+        to: signal.from + signal.insert.length,
+      };
+      const confirmedSingleRewrite =
+        candidate !== undefined &&
+        previousWasTracked &&
+        oneCodePoint(signal.insert) &&
+        syllableParts(signal.insert) !== undefined &&
+        signal.docChanged &&
+        signal.from === candidate.range.from &&
+        recent(signal.at, candidate.insertedAt, PSEUDO_INPUT_ASSOCIATION_MS);
       this.active = true;
       this.lastRange = {
         from: signal.from + signal.insert.length - tailLength,
@@ -907,6 +1013,25 @@ export class KoreanPseudoCompositionStateMachine {
       this.lastText = tail;
       this.lastRewriteTime = signal.at;
       this.rewriteCount = previousWasTracked ? this.rewriteCount + 1 : 1;
+      if (confirmedSingleRewrite && candidate) {
+        this.singleRewriteLineage = {
+          initialText: candidate.text,
+          initialRange: { ...candidate.range },
+          deletedText: pending.text,
+          deletedRange: { ...pending.range },
+          replacementText: signal.insert,
+          replacementRange,
+          rewriteIntervalMs: signal.at - candidate.insertedAt,
+          deleteInsertIntervalMs: signal.at - pending.at,
+        };
+        this.diagnostics.push({
+          eventType: "single-rewrite-lineage-confirmed",
+          details: { ...copyLineage(this.singleRewriteLineage) },
+        });
+      } else {
+        this.singleRewriteLineage = undefined;
+      }
+      this.initialFragmentCandidate = undefined;
       this.pendingDelete = undefined;
       return { kind: "allow" };
     }
@@ -923,6 +1048,31 @@ export class KoreanPseudoCompositionStateMachine {
       this.lastText = tail;
       this.lastRewriteTime = signal.at;
       this.rewriteCount = 0;
+      const keydown = this.keydown;
+      const eligibleInitialFragment =
+        signal.docChanged &&
+        isCompatibilityLead(signal.insert) &&
+        collapsed(signal.selectionBefore) &&
+        signal.selectionBefore.from === signal.from &&
+        this.keydownSelection !== undefined &&
+        sameSelection(this.keydownSelection, signal.selectionBefore) &&
+        keydown !== undefined &&
+        keydown.key === signal.insert &&
+        isHangulInputKey(keydown.key) &&
+        !keydown.isComposing &&
+        !keydown.altKey &&
+        !keydown.ctrlKey &&
+        !keydown.metaKey &&
+        recent(signal.at, keydown.at, PSEUDO_INPUT_ASSOCIATION_MS);
+      this.initialFragmentCandidate = eligibleInitialFragment
+        ? {
+            insertedAt: signal.at,
+            range: { from: signal.from, to: signal.from + signal.insert.length },
+            text: signal.insert,
+            key: keydown.key,
+          }
+        : undefined;
+      this.singleRewriteLineage = undefined;
     }
     return { kind: "allow" };
   }
@@ -991,6 +1141,12 @@ export class KoreanPseudoCompositionStateMachine {
     this.pendingDelete = undefined;
     this.pendingStaleDelete = undefined;
     this.moved = undefined;
+    this.clearSingleRewriteEvidence();
     this.keydownSelection = undefined;
+  }
+
+  private clearSingleRewriteEvidence(): void {
+    this.initialFragmentCandidate = undefined;
+    this.singleRewriteLineage = undefined;
   }
 }

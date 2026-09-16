@@ -43,6 +43,15 @@ v0.1.5는 v0.1.4 실기 trace에서 확인된 두 regression을 최소 침습적
 
 또한 물리 Backspace/Delete로 non-empty selection의 `delete.selection`이 완료된 직후, Korean keydown 없이 같은 위치에 Hangul `insertText`가 재생되는 v0.1.4 trace를 위한 one-shot guard가 추가됐습니다. 실제 replay는 삭제 완료 약 10ms 뒤 발생했으므로 guard window는 40ms로 제한했습니다. 이는 관찰값의 네 배이면서 검토 범위 40–80ms 중 가장 작은 값입니다. 새 Korean keydown, Space/Enter, printable non-Korean key, selection 변화, composition, paste/drop, undo/redo, 외부 blur, 다른 document transaction 또는 timeout에서 즉시 해제됩니다.
 
+## v0.1.7
+
+v0.1.7은 v0.1.6 실제 iPad trace에서 확인된 single-rewrite lineage를 제한적으로 보호하는 릴리스입니다.
+
+- 전역 `PSEUDO_MIN_REWRITES = 2`는 유지합니다.
+- 다만 실제 Korean keydown에 연결된 단일 호환 자모 삽입, 정확히 같은 범위·텍스트의 delete, 같은 native burst의 단일 완성 음절 replacement가 모두 확인된 경우에만 `single-confirmed-lineage` confidence로 moved guard를 arm합니다.
+- 단순 자모/완성 음절 입력, 다른 범위 삭제·삽입, unrelated Hangul, selection 중단, paste/composition/undo/redo 및 association window 밖의 입력은 이 예외를 얻지 못합니다.
+- 기존 protected source / native tail / intended state 분리, shifted-native-tail protection, post-delete stale replay suppression은 변경하지 않았습니다. Debug log 복제 관련 코드는 변경하지 않았습니다.
+
 ## v0.1.6
 
 v0.1.6은 v0.1.5 실제 iPad trace에서 확인된 두 regression만 제한적으로 수정한 릴리스입니다.
@@ -141,7 +150,7 @@ Debug OFF에서는 snippet 생성이나 JSON 직렬화를 하지 않습니다. O
 - `movedGuard.destination/intendedRange/intendedText`
 - `pendingPostDeleteReplayGuard`
 
-판정 과정은 `pseudo-moved-guard-armed`, `shifted-native-tail-delete-detected`, `stale-rewrite-detected`, `stale-rewrite-suppressed`, `atomic-repair`로 확인할 수 있습니다. `atomic-repair.details.intendedTextSource`는 stale prefix 제거면 `derived`, 검증된 native continuation이면 `native-rewrite`, 증명 불가 key 보존이면 `pending-intended-key`입니다. 해당 두 source는 별도 `native-rewrite`, `pending-intended-key` event로도 남습니다. Selection delete replay guard는 `post-delete-replay-guard-armed`, `post-delete-noop-preserved`, `post-delete-guard-disarmed`의 정확한 reason과 `stale-replay-suppressed`로 확인할 수 있습니다.
+판정 과정은 `pseudo-moved-guard-armed`, `shifted-native-tail-delete-detected`, `stale-rewrite-detected`, `stale-rewrite-suppressed`, `atomic-repair`로 확인할 수 있습니다. 일반 moved guard의 최소 기준은 계속 2회 rewrite입니다. 단, 실제 Korean keydown에 연결된 단일 호환 자모 삽입 뒤 같은 범위·같은 텍스트의 native delete와 같은 burst의 단일 완성 음절 replacement가 모두 관측된 경우에만 `single-rewrite-lineage-confirmed`로 기록하고 예외적으로 guard를 허용합니다. `pseudo-moved-guard-armed.details.guardConfidence`는 이 좁은 경로를 `single-confirmed-lineage`, 기존 경로를 `multi-rewrite`로 구분하며, 전자의 snapshot에는 initial/deleted/replacement text·range와 관측 간격만 기록됩니다. `atomic-repair.details.intendedTextSource`는 stale prefix 제거면 `derived`, 검증된 native continuation이면 `native-rewrite`, 증명 불가 key 보존이면 `pending-intended-key`입니다. 해당 두 source는 별도 `native-rewrite`, `pending-intended-key` event로도 남습니다. Selection delete replay guard는 `post-delete-replay-guard-armed`, `post-delete-noop-preserved`, `post-delete-guard-disarmed`의 정확한 reason과 `stale-replay-suppressed`로 확인할 수 있습니다.
 
 ## 안전 범위와 남은 위험
 

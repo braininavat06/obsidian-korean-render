@@ -440,9 +440,9 @@ describe("KoreanPseudoCompositionStateMachine", () => {
 
   it("requires two completed rewrites before selection movement is risky", () => {
     const machine = new KoreanPseudoCompositionStateMachine();
-    initialInsert(machine, 10, 7, "ㅇ");
-    rewrite(machine, 20, { from: 7, to: 8 }, "ㅇ", "에", "ㅔ");
-    expect(machine.onSelectionMove({ at: 30, before: cursor(8), after: cursor(3), origin: "select", textBeforeCursor: "1234567에" })).toBe(false);
+    initialInsert(machine, 10, 7, "가");
+    rewrite(machine, 20, { from: 7, to: 8 }, "가", "각", "ㄱ");
+    expect(machine.onSelectionMove({ at: 30, before: cursor(8), after: cursor(3), origin: "select", textBeforeCursor: "1234567각" })).toBe(false);
   });
 
   it("recognizes only related Hangul rewrites", () => {
