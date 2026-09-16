@@ -106,7 +106,35 @@ class KoreanImeViewTracker {
           transaction.docChanged,
           transaction.annotation(imeSuppression) === "pseudo-atomic-repair",
         );
+        let changeCount = 0;
+        let transactionFrom = -1;
+        let transactionTo = -1;
+        let transactionInsert = "";
+        transaction.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+          changeCount++;
+          transactionFrom = fromA;
+          transactionTo = toA;
+          transactionInsert = inserted.toString();
+        });
+        this.pseudo.onAppliedTransaction({
+          at: Date.now(),
+          userEvent: transactionUserEvent,
+          docChanged: transaction.docChanged,
+          changeCount,
+          from: transactionFrom,
+          to: transactionTo,
+          insert: transactionInsert,
+          selectionBefore: {
+            from: transaction.startState.selection.main.from,
+            to: transaction.startState.selection.main.to,
+          },
+          selectionAfter: {
+            from: transaction.newSelection.main.from,
+            to: transaction.newSelection.main.to,
+          },
+        });
       }
+      this.flushPseudoDiagnostics();
     }
 
     if (!this.controller.isDebugEnabled()) return;
@@ -178,6 +206,12 @@ class KoreanImeViewTracker {
     });
   }
 
+  flushPseudoDiagnostics(): void {
+    for (const diagnostic of this.pseudo.drainDiagnostics()) {
+      this.logDiagnostic(diagnostic.eventType, diagnostic.details);
+    }
+  }
+
   destroy(): void {
     for (const [type, listener] of this.listeners) {
       this.view.contentDOM.removeEventListener(type, listener, { capture: true });
@@ -240,12 +274,13 @@ class KoreanImeViewTracker {
             metaKey: keyboardEvent.metaKey,
             shiftKey: keyboardEvent.shiftKey,
             repeat: keyboardEvent.repeat,
-          });
+          }, selectionSnapshot(this.view));
           break;
         case "blur":
           this.pseudo.onExternalFocusBoundary();
           break;
       }
+      this.flushPseudoDiagnostics();
     }
 
     if (!this.controller.isDebugEnabled()) return;
@@ -340,6 +375,17 @@ function applyPseudoDecision(
     return true;
   }
 
+  if (decision.kind === "suppress-stale-replay") {
+    tracker.logDiagnostic("stale-replay-suppressed", {
+      data: decision.insert,
+      destination: decision.destination,
+      armedAt: decision.armedAt,
+      armReason: decision.armReason,
+    });
+    dispatchNoDocumentChange(view, "pseudo-post-delete-stale-replay");
+    return true;
+  }
+
   if (
     decision.replace.from < 0 ||
     decision.replace.to < decision.replace.from ||
@@ -363,6 +409,13 @@ function applyPseudoDecision(
     intendedTextSource: decision.source,
     replace: decision.replace,
   });
+  if (decision.source === "native-rewrite" || decision.source === "pending-intended-key") {
+    tracker.logDiagnostic(decision.source, {
+      insertedTrustedText: decision.insert,
+      replace: decision.replace,
+      nativeTailText: decision.nativeTailText,
+    });
+  }
   tracker.logDiagnostic("stale-rewrite-suppressed", { stage: "atomic-repair" });
   return true;
 }
@@ -436,6 +489,7 @@ export function createKoreanImeEditorExtension(controller: ExtensionController):
       sourceStillPresent,
     };
     const pseudoDecision = tracker.pseudo.evaluate(pseudoSignal);
+    tracker.flushPseudoDiagnostics();
     return applyPseudoDecision(view, tracker, pseudoDecision);
   });
 

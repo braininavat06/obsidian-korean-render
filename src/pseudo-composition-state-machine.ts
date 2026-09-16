@@ -22,6 +22,18 @@ export interface PseudoTransactionSignal {
   sourceStillPresent: boolean;
 }
 
+export interface AppliedTransactionSignal {
+  at: number;
+  userEvent: string | undefined;
+  docChanged: boolean;
+  changeCount: number;
+  from: number;
+  to: number;
+  insert: string;
+  selectionBefore: SelectionSnapshot;
+  selectionAfter: SelectionSnapshot;
+}
+
 export type PseudoDecision =
   | { kind: "allow" }
   | {
@@ -37,6 +49,14 @@ export type PseudoDecision =
       staleText: string;
       originalText: string;
       source: "derived" | "native-rewrite" | "pending-intended-key";
+      nativeTailText: string;
+    }
+  | {
+      kind: "suppress-stale-replay";
+      insert: string;
+      destination: SelectionSnapshot;
+      armedAt: number;
+      armReason: string;
     }
 
 export type AtomicRepairDecision = Extract<PseudoDecision, { kind: "atomic-repair" }>;
@@ -51,11 +71,20 @@ export interface PseudoDebugSnapshot {
   };
   selectionMovedOutsidePseudoRange: boolean;
   movedGuard: {
-    sourceRange: TextRange;
-    sourceText: string;
+    protectedSourceRange: TextRange;
+    protectedSourceText: string;
+    nativeTailRange: TextRange;
+    nativeTailText: string;
     destination: SelectionSnapshot;
     intendedRange: TextRange | null;
     intendedText: string;
+  } | null;
+  pendingPostDeleteReplayGuard: {
+    armedAt: number;
+    expiresAt: number;
+    destination: SelectionSnapshot;
+    deletedRange: TextRange;
+    armReason: string;
   } | null;
 }
 
@@ -73,15 +102,37 @@ interface PendingStaleDelete {
 }
 
 interface MovedPseudoComposition {
-  sourceRange: TextRange;
-  sourceText: string;
+  protectedSourceRange: TextRange;
+  protectedSourceText: string;
+  nativeTailRange: TextRange;
+  nativeTailText: string;
   destination: SelectionSnapshot;
   intended?: { range: TextRange; text: string };
+}
+
+interface PendingSelectionDeleteKey {
+  at: number;
+  key: "Backspace" | "Delete";
+  selection: SelectionSnapshot;
+}
+
+interface PendingPostDeleteReplayGuard {
+  armedAt: number;
+  expiresAt: number;
+  destination: SelectionSnapshot;
+  deletedRange: TextRange;
+  armReason: string;
+}
+
+export interface PseudoDiagnostic {
+  eventType: "post-delete-replay-guard-armed" | "post-delete-replay-guard-disarmed";
+  details: Record<string, unknown>;
 }
 
 export const PSEUDO_REWRITE_PAIR_MS = 80;
 export const PSEUDO_INPUT_ASSOCIATION_MS = 160;
 export const PSEUDO_MIN_REWRITES = 2;
+export const POST_DELETE_REPLAY_GUARD_MS = 40;
 
 const COMPAT_LEADS = [
   "ㄱ",
@@ -215,6 +266,46 @@ function attachFinalConsonant(staleText: string, key: string): string | undefine
   return String.fromCodePoint(0xac00 + parts.lead * 588 + parts.vowel * 28 + final);
 }
 
+function syllableWithoutFinal(text: string): string | undefined {
+  if (!oneCodePoint(text)) return undefined;
+  const parts = syllableParts(text);
+  if (!parts || parts.final === 0) return undefined;
+  return String.fromCodePoint(0xac00 + parts.lead * 588 + parts.vowel * 28);
+}
+
+function nativeCarrySuffix(nativeTail: string, inserted: string): string | undefined {
+  if (inserted.startsWith(nativeTail)) {
+    const suffix = inserted.slice(nativeTail.length);
+    return isHangulText(suffix) ? suffix : undefined;
+  }
+  const withoutFinal = syllableWithoutFinal(nativeTail);
+  if (!withoutFinal || !inserted.startsWith(withoutFinal)) return undefined;
+  const suffix = inserted.slice(withoutFinal.length);
+  return isHangulText(suffix) ? suffix : undefined;
+}
+
+function nativeResultConsumesPendingSequence(
+  pendingText: string,
+  key: string,
+  inserted: string,
+): boolean {
+  if (!oneCodePoint(inserted)) return false;
+  const sequence = [...Array.from(pendingText), key];
+  if (sequence.length < 2 || sequence.length > 3) return false;
+  const lead = COMPAT_LEADS.indexOf(sequence[0] as (typeof COMPAT_LEADS)[number]);
+  const vowel = COMPAT_VOWELS.indexOf(sequence[1] as (typeof COMPAT_VOWELS)[number]);
+  if (lead < 0 || vowel < 0) return false;
+  const final = sequence.length === 3 ? FINAL_INDEX.get(sequence[2] ?? "") : 0;
+  if (final === undefined) return false;
+  const insertedParts = syllableParts(inserted);
+  return (
+    insertedParts !== undefined &&
+    insertedParts.lead === lead &&
+    insertedParts.vowel === vowel &&
+    insertedParts.final === final
+  );
+}
+
 function isDirectHangulRewrite(previous: string, inserted: string): boolean {
   const first = Array.from(inserted)[0];
   return first !== undefined && isConnectedHangulRewrite(previous, first);
@@ -254,38 +345,78 @@ export class KoreanPseudoCompositionStateMachine {
   private pendingDelete: PendingDelete | undefined;
   private pendingStaleDelete: PendingStaleDelete | undefined;
   private moved: MovedPseudoComposition | undefined;
+  private pendingSelectionDeleteKey: PendingSelectionDeleteKey | undefined;
+  private pendingPostDeleteReplayGuard: PendingPostDeleteReplayGuard | undefined;
+  private readonly diagnostics: PseudoDiagnostic[] = [];
 
   onRealCompositionEvent(): void {
-    this.clear();
+    this.disarmPostDeleteReplayGuard("composition-event");
+    this.pendingSelectionDeleteKey = undefined;
+    this.clearCompositionState();
   }
 
   onExternalFocusBoundary(): void {
-    this.clear();
+    this.disarmPostDeleteReplayGuard("external-blur");
+    this.pendingSelectionDeleteKey = undefined;
+    this.clearCompositionState();
   }
 
-  onKeyDown(signal: KeySignal): void {
+  onKeyDown(signal: KeySignal, selection?: SelectionSnapshot): void {
+    this.expirePostDeleteReplayGuard(signal.at);
+    if (this.pendingPostDeleteReplayGuard) {
+      this.disarmPostDeleteReplayGuard(
+        isHangulInputKey(signal.key) ? "korean-keydown" : `keydown:${signal.key}`,
+      );
+    }
+    if (
+      !signal.isComposing &&
+      !signal.altKey &&
+      !signal.ctrlKey &&
+      !signal.metaKey &&
+      (signal.key === "Backspace" || signal.key === "Delete") &&
+      selection &&
+      !collapsed(selection)
+    ) {
+      this.pendingSelectionDeleteKey = {
+        at: signal.at,
+        key: signal.key,
+        selection: { ...selection },
+      };
+    } else {
+      this.pendingSelectionDeleteKey = undefined;
+    }
     this.keydown = signal;
     if (signal.isComposing) return;
     if (signal.altKey || signal.ctrlKey || signal.metaKey) {
-      this.clear();
+      this.clearCompositionState();
       this.keydown = signal;
       return;
     }
     if (naturalBoundaryKey(signal.key) || languageSwitchKey(signal.key)) {
-      this.clear();
+      this.clearCompositionState();
       this.keydown = signal;
       return;
     }
     if (signal.key.length === 1 && !isHangulInputKey(signal.key)) {
-      this.clear();
+      this.clearCompositionState();
       this.keydown = signal;
     }
   }
 
   onBeforeInput(signal: BeforeInputSignal): void {
+    this.expirePostDeleteReplayGuard(signal.at);
     this.beforeInput = signal;
     if (signal.isComposing) {
-      this.clear();
+      this.pendingSelectionDeleteKey = undefined;
+      this.disarmPostDeleteReplayGuard("composing-beforeinput");
+      this.clearCompositionState();
+      this.beforeInput = signal;
+      return;
+    }
+    if (signal.inputType === "insertFromPaste" || signal.inputType === "insertFromDrop") {
+      this.pendingSelectionDeleteKey = undefined;
+      this.disarmPostDeleteReplayGuard(signal.inputType);
+      this.clearCompositionState();
       this.beforeInput = signal;
       return;
     }
@@ -294,18 +425,23 @@ export class KoreanPseudoCompositionStateMachine {
       signal.inputType === "insertLineBreak" ||
       (signal.inputType === "insertText" && signal.data !== null && !isHangulText(signal.data))
     ) {
-      this.clear();
+      this.pendingSelectionDeleteKey = undefined;
+      this.disarmPostDeleteReplayGuard(`beforeinput:${signal.inputType}`);
+      this.clearCompositionState();
       this.beforeInput = signal;
     }
   }
 
   onSelectionMove(signal: SelectionMoveSignal): boolean {
+    this.expirePostDeleteReplayGuard(signal.at);
+    this.pendingSelectionDeleteKey = undefined;
+    this.disarmPostDeleteReplayGuard("selection-change");
     if (
       signal.origin === "other" ||
       sameSelection(signal.before, signal.after) ||
       !collapsed(signal.after)
     ) {
-      if (!collapsed(signal.after)) this.clear();
+      if (!collapsed(signal.after)) this.clearCompositionState();
       return false;
     }
 
@@ -333,8 +469,10 @@ export class KoreanPseudoCompositionStateMachine {
     }
 
     this.moved = {
-      sourceRange: { ...this.lastRange },
-      sourceText: this.lastText,
+      protectedSourceRange: { ...this.lastRange },
+      protectedSourceText: this.lastText,
+      nativeTailRange: { ...this.lastRange },
+      nativeTailText: this.lastText,
       destination: signal.after,
     };
     this.pendingDelete = undefined;
@@ -343,7 +481,9 @@ export class KoreanPseudoCompositionStateMachine {
   }
 
   evaluate(signal: PseudoTransactionSignal): PseudoDecision {
+    this.expirePostDeleteReplayGuard(signal.at);
     if (signal.changeCount !== 1) {
+      this.disarmPostDeleteReplayGuard("multi-change-transaction");
       this.pendingDelete = undefined;
       this.pendingStaleDelete = undefined;
       return { kind: "allow" };
@@ -358,6 +498,7 @@ export class KoreanPseudoCompositionStateMachine {
 
     this.pendingDelete = undefined;
     this.pendingStaleDelete = undefined;
+    this.disarmPostDeleteReplayGuard("non-matching-input-transaction");
     return { kind: "allow" };
   }
 
@@ -367,13 +508,62 @@ export class KoreanPseudoCompositionStateMachine {
     preserveMovedGuard = false,
   ): void {
     if (!docChanged) return;
+    this.disarmPostDeleteReplayGuard(
+      userEvent === "undo" || userEvent === "redo"
+        ? userEvent
+        : "other-document-transaction",
+    );
     if (this.moved && !preserveMovedGuard) {
-      this.clear();
+      this.clearCompositionState();
       return;
     }
     if (userEvent === "undo" || userEvent === "redo" || !userEvent?.startsWith("input.type")) {
-      this.clear();
+      this.clearCompositionState();
     }
+  }
+
+  onAppliedTransaction(signal: AppliedTransactionSignal): void {
+    const pending = this.pendingSelectionDeleteKey;
+    this.pendingSelectionDeleteKey = undefined;
+    if (
+      !pending ||
+      !signal.docChanged ||
+      signal.userEvent !== "delete.selection" ||
+      !recent(signal.at, pending.at, PSEUDO_INPUT_ASSOCIATION_MS) ||
+      collapsed(pending.selection) ||
+      !sameSelection(pending.selection, signal.selectionBefore) ||
+      signal.changeCount !== 1 ||
+      signal.from !== pending.selection.from ||
+      signal.to !== pending.selection.to ||
+      signal.insert !== "" ||
+      !sameSelection(signal.selectionAfter, {
+        from: pending.selection.from,
+        to: pending.selection.from,
+      })
+    ) {
+      return;
+    }
+    const armReason = `physical-${pending.key.toLowerCase()}-delete.selection`;
+    this.pendingPostDeleteReplayGuard = {
+      armedAt: signal.at,
+      expiresAt: signal.at + POST_DELETE_REPLAY_GUARD_MS,
+      destination: { ...signal.selectionAfter },
+      deletedRange: { from: signal.from, to: signal.to },
+      armReason,
+    };
+    this.diagnostics.push({
+      eventType: "post-delete-replay-guard-armed",
+      details: {
+        reason: armReason,
+        windowMs: POST_DELETE_REPLAY_GUARD_MS,
+        destination: { ...signal.selectionAfter },
+        deletedRange: { from: signal.from, to: signal.to },
+      },
+    });
+  }
+
+  drainDiagnostics(): PseudoDiagnostic[] {
+    return this.diagnostics.splice(0);
   }
 
   commitAtomicRepair(decision: AtomicRepairDecision): void {
@@ -382,13 +572,13 @@ export class KoreanPseudoCompositionStateMachine {
     const previousIntended = moved.intended;
     const replacedLength = decision.replace.to - decision.replace.from;
     const delta = decision.insert.length - replacedLength;
-    if (decision.replace.to <= moved.sourceRange.from) {
-      moved.sourceRange = {
-        from: moved.sourceRange.from + delta,
-        to: moved.sourceRange.to + delta,
+    if (decision.replace.to <= moved.protectedSourceRange.from) {
+      moved.protectedSourceRange = {
+        from: moved.protectedSourceRange.from + delta,
+        to: moved.protectedSourceRange.to + delta,
       };
-    } else if (decision.replace.from < moved.sourceRange.to) {
-      this.clear();
+    } else if (decision.replace.from < moved.protectedSourceRange.to) {
+      this.clearCompositionState();
       return;
     }
     if (
@@ -418,12 +608,21 @@ export class KoreanPseudoCompositionStateMachine {
       from: moved.intended.range.to,
       to: moved.intended.range.to,
     };
+    const nativeTail = Array.from(decision.nativeTailText).at(-1) ?? "";
+    moved.nativeTailRange = {
+      from: moved.intended.range.to - nativeTail.length,
+      to: moved.intended.range.to,
+    };
+    moved.nativeTailText = nativeTail;
     this.pendingStaleDelete = undefined;
   }
 
   getSourceGuard(): { range: TextRange; text: string } | undefined {
     return this.moved
-      ? { range: { ...this.moved.sourceRange }, text: this.moved.sourceText }
+      ? {
+          range: { ...this.moved.protectedSourceRange },
+          text: this.moved.protectedSourceText,
+        }
       : undefined;
   }
 
@@ -439,11 +638,22 @@ export class KoreanPseudoCompositionStateMachine {
       selectionMovedOutsidePseudoRange: this.moved !== undefined,
       movedGuard: this.moved
         ? {
-            sourceRange: { ...this.moved.sourceRange },
-            sourceText: this.moved.sourceText,
+            protectedSourceRange: { ...this.moved.protectedSourceRange },
+            protectedSourceText: this.moved.protectedSourceText,
+            nativeTailRange: { ...this.moved.nativeTailRange },
+            nativeTailText: this.moved.nativeTailText,
             destination: { ...this.moved.destination },
             intendedRange: this.moved.intended ? { ...this.moved.intended.range } : null,
             intendedText: this.moved.intended?.text ?? "",
+          }
+        : null,
+      pendingPostDeleteReplayGuard: this.pendingPostDeleteReplayGuard
+        ? {
+            armedAt: this.pendingPostDeleteReplayGuard.armedAt,
+            expiresAt: this.pendingPostDeleteReplayGuard.expiresAt,
+            destination: { ...this.pendingPostDeleteReplayGuard.destination },
+            deletedRange: { ...this.pendingPostDeleteReplayGuard.deletedRange },
+            armReason: this.pendingPostDeleteReplayGuard.armReason,
           }
         : null,
     };
@@ -479,7 +689,7 @@ export class KoreanPseudoCompositionStateMachine {
         : signal.to === signal.selectionBefore.to &&
           signal.from < signal.to &&
           oneCodePoint(signal.deletedText) &&
-          !sameRange(this.moved.sourceRange, { from: signal.from, to: signal.to });
+          !sameRange(this.moved.protectedSourceRange, { from: signal.from, to: signal.to });
 
       if (
         recentDeleteBeforeInput &&
@@ -500,7 +710,7 @@ export class KoreanPseudoCompositionStateMachine {
           kind: "suppress-stale-delete",
           originalText: signal.deletedText,
           range: { from: signal.from, to: signal.to },
-          staleText: this.moved.sourceText,
+          staleText: this.moved.nativeTailText,
         };
       }
 
@@ -533,6 +743,30 @@ export class KoreanPseudoCompositionStateMachine {
       beforeInput.data === signal.insert &&
       recent(signal.at, beforeInput.at, PSEUDO_INPUT_ASSOCIATION_MS);
 
+    const replayGuard = this.pendingPostDeleteReplayGuard;
+    if (replayGuard) {
+      const matchesReplay =
+        signal.at <= replayGuard.expiresAt &&
+        recentInsertBeforeInput &&
+        inputTypeEvent(signal.userEvent) &&
+        isHangulText(signal.insert) &&
+        signal.from === signal.to &&
+        signal.from === replayGuard.destination.from &&
+        sameSelection(signal.selectionBefore, replayGuard.destination);
+      if (matchesReplay) {
+        const decision: PseudoDecision = {
+          kind: "suppress-stale-replay",
+          insert: signal.insert,
+          destination: { ...replayGuard.destination },
+          armedAt: replayGuard.armedAt,
+          armReason: replayGuard.armReason,
+        };
+        this.disarmPostDeleteReplayGuard("suppressed-one-shot");
+        return decision;
+      }
+      this.disarmPostDeleteReplayGuard("non-matching-input-transaction");
+    }
+
     if (this.pendingStaleDelete && this.moved) {
       const pending = this.pendingStaleDelete;
       const pairIsImmediate = signal.at - pending.at <= PSEUDO_REWRITE_PAIR_MS;
@@ -548,15 +782,18 @@ export class KoreanPseudoCompositionStateMachine {
       }
 
       const intended = this.deriveIntendedText(
-        this.moved.sourceText,
+        this.moved.protectedSourceText,
+        this.moved.nativeTailText,
         pending.intendedKey,
         signal.insert,
         pending.originalText,
-        this.moved.intended !== undefined,
+        this.moved.intended?.text,
       );
       const replace = intended
         ? this.moved.intended
-          ? pending.range
+          ? intended.replaceWholeIntended
+            ? this.moved.intended.range
+            : pending.range
           : { from: this.moved.destination.from, to: this.moved.destination.to }
         : { from: this.moved.destination.from, to: this.moved.destination.to };
       this.pendingStaleDelete = undefined;
@@ -564,9 +801,10 @@ export class KoreanPseudoCompositionStateMachine {
         kind: "atomic-repair",
         insert: intended?.text ?? pending.intendedKey,
         replace,
-        staleText: this.moved.sourceText,
+        staleText: this.moved.nativeTailText,
         originalText: pending.originalText,
         source: intended?.source ?? "pending-intended-key",
+        nativeTailText: signal.insert,
       };
     }
 
@@ -599,7 +837,7 @@ export class KoreanPseudoCompositionStateMachine {
 
     this.pendingDelete = undefined;
     if (recentInsertBeforeInput && inputTypeEvent(signal.userEvent) && isHangulText(signal.insert)) {
-      if (this.moved) this.clear();
+      if (this.moved) this.clearCompositionState();
       const tail = Array.from(signal.insert).at(-1) ?? "";
       this.active = true;
       this.lastRange = {
@@ -614,27 +852,61 @@ export class KoreanPseudoCompositionStateMachine {
   }
 
   private deriveIntendedText(
-    staleText: string,
+    protectedSourceText: string,
+    nativeTailText: string,
     key: string,
     inserted: string,
     replacedText: string,
-    hasIntendedText: boolean,
-  ): { text: string; source: "derived" | "native-rewrite" } | undefined {
+    intendedText: string | undefined,
+  ):
+    | {
+        text: string;
+        source: "derived" | "native-rewrite";
+        replaceWholeIntended?: boolean;
+      }
+    | undefined {
     if (!isHangulInputKey(key)) return undefined;
-    if (hasIntendedText && isDirectHangulRewrite(replacedText, inserted)) {
+    if (
+      intendedText !== undefined &&
+      nativeResultConsumesPendingSequence(intendedText, key, inserted)
+    ) {
+      return { text: inserted, source: "native-rewrite", replaceWholeIntended: true };
+    }
+    if (intendedText !== undefined && isDirectHangulRewrite(replacedText, inserted)) {
       return { text: inserted, source: "native-rewrite" };
     }
-    if (inserted.startsWith(staleText)) {
-      const suffix = inserted.slice(staleText.length);
-      return isHangulText(suffix) ? { text: suffix, source: "derived" } : undefined;
-    }
-    if (attachFinalConsonant(staleText, key) === inserted) {
-      return { text: key, source: "derived" };
+    for (const carry of new Set([nativeTailText, protectedSourceText])) {
+      const suffix = nativeCarrySuffix(carry, inserted);
+      if (suffix) return { text: suffix, source: "derived" };
+      if (attachFinalConsonant(carry, key) === inserted) {
+        return { text: key, source: "derived" };
+      }
     }
     return undefined;
   }
 
-  private clear(): void {
+  private expirePostDeleteReplayGuard(at: number): void {
+    if (this.pendingPostDeleteReplayGuard && at > this.pendingPostDeleteReplayGuard.expiresAt) {
+      this.disarmPostDeleteReplayGuard("timeout");
+    }
+  }
+
+  private disarmPostDeleteReplayGuard(reason: string): void {
+    const guard = this.pendingPostDeleteReplayGuard;
+    if (!guard) return;
+    this.pendingPostDeleteReplayGuard = undefined;
+    this.diagnostics.push({
+      eventType: "post-delete-replay-guard-disarmed",
+      details: {
+        reason,
+        armedAt: guard.armedAt,
+        destination: { ...guard.destination },
+        deletedRange: { ...guard.deletedRange },
+      },
+    });
+  }
+
+  private clearCompositionState(): void {
     this.active = false;
     this.lastRange = undefined;
     this.lastText = "";

@@ -225,6 +225,7 @@ describe("KoreanPseudoCompositionStateMachine", () => {
       staleText: "휴",
       originalText: "더",
       source: "derived",
+      nativeTailText: "흉",
     });
     if (firstRepair.kind !== "atomic-repair") throw new Error("expected repair");
     machine.commitAtomicRepair(firstRepair);
@@ -240,9 +241,10 @@ describe("KoreanPseudoCompositionStateMachine", () => {
       kind: "atomic-repair",
       insert: "이",
       replace: { from: 3, to: 4 },
-      staleText: "휴",
+      staleText: "흉",
       originalText: "ㅇ",
       source: "derived",
+      nativeTailText: "휴이",
     });
   });
 
@@ -336,6 +338,7 @@ describe("KoreanPseudoCompositionStateMachine", () => {
       staleText: "휴",
       originalText: "더",
       source: "pending-intended-key",
+      nativeTailText: "가",
     });
     if (firstRepair.kind !== "atomic-repair") throw new Error("expected repair");
     machine.commitAtomicRepair(firstRepair);
@@ -366,9 +369,10 @@ describe("KoreanPseudoCompositionStateMachine", () => {
       kind: "atomic-repair",
       insert: "ㅣ",
       replace: { from: 4, to: 4 },
-      staleText: "휴",
+      staleText: "흉",
       originalText: "ㅇ",
       source: "pending-intended-key",
+      nativeTailText: "마",
     });
   });
 

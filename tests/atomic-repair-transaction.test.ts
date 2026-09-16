@@ -15,6 +15,7 @@ function repair(insert: string, from: number, to: number, originalText: string):
     staleText: "휴",
     originalText,
     source: "derived",
+    nativeTailText: insert,
   };
 }
 
@@ -77,6 +78,7 @@ describe("atomic repair transaction", () => {
       staleText: "라",
       originalText: "가",
       source: "native-rewrite",
+      nativeTailText: "가나",
     };
     const transaction = createAtomicRepairTransaction(state, decision);
     expect(transaction.newDoc.toString()).toBe("가나가나다라");

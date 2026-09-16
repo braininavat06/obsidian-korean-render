@@ -31,6 +31,18 @@ v0.1.3 실기 로그에서 확인한 핵심 결과는 다음과 같습니다.
 - 현재 repair는 stale prefix를 제거할 수 있는 첫 단계 뒤, iPadOS가 준 `beforeinput.data`가 현재 목적지 음절의 연결된 rewrite임을 증명할 수 있을 때 그 native text를 사용합니다. 임의 Hangul composer나 keyboard-layout 변환은 사용하지 않습니다.
 - 증명할 수 없는 실제 Korean key는 기존 intended text를 덮어쓰지 않고 현재 cursor에 보존합니다.
 
+## v0.1.5
+
+v0.1.5는 v0.1.4 실기 trace에서 확인된 두 regression을 최소 침습적으로 수정합니다. Document 보호 source와 native IME의 현재 rewrite tail이 서로 달라질 수 있으므로 다음 세 상태를 독립적으로 추적합니다.
+
+- `protectedSourceRange/Text`: cursor 이동 전 원래 pseudo-composition source. 기존 document가 유지되는지 검증하는 용도로만 사용합니다.
+- `nativeTailRange/Text`: WebKit이 실제 delete/insert rewrite에 사용한 현재 tail. 실제 native data로만 갱신합니다.
+- `intendedRange/Text`: 새 위치에서 atomic repair로 복구 중인 사용자 입력입니다.
+
+따라서 첫 repair 뒤 native tail이 `라`에서 `나`로 바뀐 실제 `나 → 낙 → 나가 → 간 → 가나` 흐름도 원래 protected source를 변경하지 않고 따라갑니다. Native result가 동일 repair lineage의 pending Jamo 전체를 합성했음이 Unicode 분해로 정확히 검증되는 좁은 경우에는 마지막 code point가 아니라 pending intended range 전체를 교체합니다. 플러그인이 임의의 Hangul 결과를 생성하지는 않습니다.
+
+또한 물리 Backspace/Delete로 non-empty selection의 `delete.selection`이 완료된 직후, Korean keydown 없이 같은 위치에 Hangul `insertText`가 재생되는 v0.1.4 trace를 위한 one-shot guard가 추가됐습니다. 실제 replay는 삭제 완료 약 10ms 뒤 발생했으므로 guard window는 40ms로 제한했습니다. 이는 관찰값의 네 배이면서 검토 범위 40–80ms 중 가장 작은 값입니다. 새 Korean keydown, Space/Enter, printable non-Korean key, selection 변화, composition, paste/drop, undo/redo, 외부 blur, 다른 document transaction 또는 timeout에서 즉시 해제됩니다.
+
 ## 확인된 root cause
 
 외장 Bluetooth keyboard를 사용하는 실제 iPadOS 환경에서는 일반적인 IME composition 신호가 하나도 오지 않았습니다.
@@ -116,9 +128,12 @@ Debug OFF에서는 snippet 생성이나 JSON 직렬화를 하지 않습니다. O
 - `pseudoComposition.lastRewriteTime`
 - `pseudoComposition.rewriteCount`
 - `selectionMovedOutsidePseudoRange`
-- `movedGuard.sourceRange/sourceText/destination/intendedRange/intendedText`
+- `movedGuard.protectedSourceRange/protectedSourceText`
+- `movedGuard.nativeTailRange/nativeTailText`
+- `movedGuard.destination/intendedRange/intendedText`
+- `pendingPostDeleteReplayGuard`
 
-판정 과정은 `pseudo-moved-guard-armed`, `stale-rewrite-detected`, `stale-rewrite-suppressed`, `atomic-repair`로 확인할 수 있습니다. `atomic-repair.details.intendedTextSource`는 stale prefix 제거면 `derived`, 검증된 native continuation이면 `native-rewrite`, 증명 불가 key 보존이면 `pending-intended-key`입니다.
+판정 과정은 `pseudo-moved-guard-armed`, `stale-rewrite-detected`, `stale-rewrite-suppressed`, `atomic-repair`로 확인할 수 있습니다. `atomic-repair.details.intendedTextSource`는 stale prefix 제거면 `derived`, 검증된 native continuation이면 `native-rewrite`, 증명 불가 key 보존이면 `pending-intended-key`입니다. 해당 두 source는 별도 `native-rewrite`, `pending-intended-key` event로도 남습니다. Selection delete replay guard는 `post-delete-replay-guard-armed`, `post-delete-replay-guard-disarmed`의 reason과 `stale-replay-suppressed`로 확인할 수 있습니다.
 
 ## 안전 범위와 남은 위험
 
