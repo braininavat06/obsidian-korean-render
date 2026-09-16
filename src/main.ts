@@ -9,13 +9,11 @@ import {
 interface KoreanImeFixSettings {
   enabled: boolean;
   debugLogging: boolean;
-  experimentalImeResetOnCursorMove: boolean;
 }
 
 const DEFAULT_SETTINGS: KoreanImeFixSettings = {
   enabled: true,
   debugLogging: false,
-  experimentalImeResetOnCursorMove: false,
 };
 
 export default class KoreanImeFixPlugin extends Plugin implements ExtensionController {
@@ -31,10 +29,6 @@ export default class KoreanImeFixPlugin extends Plugin implements ExtensionContr
         typeof stored.debugLogging === "boolean"
           ? stored.debugLogging
           : DEFAULT_SETTINGS.debugLogging,
-      experimentalImeResetOnCursorMove:
-        typeof stored.experimentalImeResetOnCursorMove === "boolean"
-          ? stored.experimentalImeResetOnCursorMove
-          : DEFAULT_SETTINGS.experimentalImeResetOnCursorMove,
     };
 
     this.registerEditorExtension(createKoreanImeEditorExtension(this));
@@ -64,10 +58,6 @@ export default class KoreanImeFixPlugin extends Plugin implements ExtensionContr
     return this.settings.debugLogging;
   }
 
-  isExperimentalImeResetEnabled(): boolean {
-    return Platform.isIosApp && this.settings.enabled && this.settings.experimentalImeResetOnCursorMove;
-  }
-
   async updateSettings(next: Partial<KoreanImeFixSettings>): Promise<void> {
     const debugLoggingChanged =
       typeof next.debugLogging === "boolean" &&
@@ -82,7 +72,6 @@ export default class KoreanImeFixPlugin extends Plugin implements ExtensionContr
       plugin: this.manifest.id,
       pluginVersion: this.manifest.version,
       iosFixActive: this.isFixEnabled(),
-      experimentalImeResetOnCursorMove: this.isExperimentalImeResetEnabled(),
       debugLogging: this.settings.debugLogging,
       userAgent: navigator.userAgent,
       note: "Only short cursor-adjacent document snippets are recorded.",
@@ -124,17 +113,5 @@ class KoreanImeFixSettingTab extends PluginSettingTab {
         }),
       );
 
-    new Setting(this.containerEl)
-      .setName("Experimental IME reset on cursor move")
-      .setDesc(
-        "Diagnostic iOS/iPadOS experiment. Briefly blurs and refocuses the editor after a confirmed Korean pseudo-composition moves; the software keyboard may flicker or dismiss.",
-      )
-      .addToggle((toggle) =>
-        toggle
-          .setValue(this.plugin.settings.experimentalImeResetOnCursorMove)
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({ experimentalImeResetOnCursorMove: value });
-          }),
-      );
   }
 }

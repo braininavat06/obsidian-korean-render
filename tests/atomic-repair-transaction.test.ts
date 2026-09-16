@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   createAtomicRepairTransaction,
-  createSelectionRestoreTransaction,
   imeSuppression,
 } from "../src/editor-extension";
 import type { AtomicRepairDecision } from "../src/pseudo-composition-state-machine";
@@ -66,17 +65,28 @@ describe("atomic repair transaction", () => {
     expect(transaction.annotation(Transaction.addToHistory)).not.toBe(false);
   });
 
-  it("restores a reset-changed selection without document or history changes", () => {
+  it("round-trips a multi-syllable native rewrite through undo and redo changes", () => {
     const state = EditorState.create({
-      doc: "가나다",
-      selection: EditorSelection.cursor(0),
+      doc: "가나가다라",
+      selection: EditorSelection.cursor(3),
     });
-    const transaction = createSelectionRestoreTransaction(state, EditorSelection.single(2));
+    const decision: AtomicRepairDecision = {
+      kind: "atomic-repair",
+      insert: "가나",
+      replace: { from: 2, to: 3 },
+      staleText: "라",
+      originalText: "가",
+      source: "native-rewrite",
+    };
+    const transaction = createAtomicRepairTransaction(state, decision);
+    expect(transaction.newDoc.toString()).toBe("가나가나다라");
+    expect(transaction.newSelection.main.from).toBe(4);
 
-    expect(transaction.docChanged).toBe(false);
-    expect(transaction.newDoc.toString()).toBe("가나다");
-    expect(transaction.newSelection.main.from).toBe(2);
-    expect(transaction.annotation(Transaction.addToHistory)).toBe(false);
-    expect(transaction.annotation(imeSuppression)).toBe("experimental-ime-reset-selection-restore");
+    const inverse = transaction.changes.invert(transaction.startState.doc);
+    const undone = transaction.state.update({ changes: inverse });
+    expect(undone.newDoc.toString()).toBe("가나가다라");
+
+    const redone = undone.state.update({ changes: transaction.changes });
+    expect(redone.newDoc.toString()).toBe("가나가나다라");
   });
 });

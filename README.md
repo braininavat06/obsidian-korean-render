@@ -8,19 +8,28 @@ Obsidian Mobile의 기본 Live Preview를 그대로 유지하면서, iOS/iPadOS 
 - 정상 composition event가 오는 환경의 v0.1.0 경로를 그대로 유지합니다.
 - `@codemirror/*`를 bundle하지 않고 Obsidian이 제공하는 인스턴스를 사용합니다.
 
-> v0.1.2 실기기 로그에서는 native stale state가 atomic repair 뒤와 11초 이상의 정지 뒤에도 지속되고, 일부 입력 유실 및 guard 이탈이 확인되었습니다. v0.1.3의 reset 기능은 이 현상을 실기에서 비교하기 위한 **기본 OFF 진단 실험**이며, production-safe fix나 native IME reset 보장을 의미하지 않습니다.
+> v0.1.3 A/B 실기 로그에서 `blur → requestAnimationFrame → focus({preventScroll:true})`는 native stale IME state를 종료하지 못했습니다. reset 직후 첫 Korean 입력에서도 destructive delete와 stale rewrite가 동일하게 발생했고, 실기에서 cursor가 튀는 부작용도 관찰되어 해당 실험 설정과 focus cycle은 v0.1.4에서 제거했습니다.
 
-## v0.1.3
+## v0.1.4
 
-v0.1.3은 기존 repair를 유지하면서 native IME stale state를 focus cycle로 종료할 수 있는지 검증하기 위한 진단 release입니다.
+v0.1.4는 v0.1.3의 실제 iPadOS + Bluetooth keyboard A/B trace를 ground truth로 삼아 repair 경로를 보수적으로 수정한 릴리스입니다.
 
-- **Experimental IME reset on cursor move** 설정을 추가했습니다. 기본값은 OFF이며 iOS/iPadOS에서만 동작합니다.
-- 최소 두 번의 Korean pseudo-composition rewrite가 확인된 뒤 selection이 active range 밖으로 이동한 경우에만 `blur → requestAnimationFrame → focus({preventScroll:true})`를 실행합니다.
-- 이 focus cycle이 native IME stale state를 실제로 종료한다고 가정하지 않습니다. reset 뒤 첫 Korean 입력의 delete/rewrite trace를 OFF/ON으로 비교해야 합니다.
-- reset 전 CM selection과 scroll/visual viewport를 기록하고, selection이 바뀌면 document/history 변경 없는 공식 CM dispatch로 복원합니다.
-- 증명할 수 없는 stale insertion에서도 신뢰 가능한 단일 Korean `keydown.key`를 `pending-intended-key`로 보존해 사용자 입력이 조용히 사라지지 않도록 수정했습니다. 임의 Hangul composition은 구현하지 않습니다.
-- atomic repair 뒤 selection이 다시 이동하면 이전 `intended.range`를 폐기하고 새 destination을 guard하도록 수정했습니다.
-- 단순 1.5초 경과로 stale 가능성을 종료하지 않고, Space/Enter·비한글 입력·입력 모드 전환·외부 focus boundary 같은 명시적인 session boundary를 사용합니다.
+- `Experimental IME reset on cursor move` 설정과 UI를 완전히 제거했습니다.
+- 효과가 없고 cursor jump가 관찰된 `blur → requestAnimationFrame → focus({preventScroll:true})` reset 코드를 제거했습니다.
+- `pending-intended-key`가 기존 intended range를 raw Jamo로 덮어쓰던 regression을 수정했습니다.
+- iPadOS가 제공하는 native Korean rewrite continuation을 검증한 뒤 사용할 수 있도록 했습니다.
+- 이동 목적지의 intended text/range를 누적 추적하고, selection이 다시 이동하면 이전 intended range를 폐기합니다.
+- moved guard의 source/destination/intended diagnostics를 강화했습니다.
+- 실제 A/B trace를 익명화한 fixture와 replay regression test를 추가했습니다.
+
+v0.1.3 실기 로그에서 확인한 핵심 결과는 다음과 같습니다.
+
+- A/OFF와 B/ON 모두 cursor 이동 뒤 첫 key에서 `deleteContentBackward → stale Hangul insert`가 발생했습니다.
+- B의 네 번의 focus cycle은 CM selection/document/scroll을 로그상 보존했지만 native stale state는 보존된 채였고, 실기에서는 cursor jump가 관찰됐습니다.
+- 따라서 experimental reset 설정과 모든 plugin-initiated blur/focus 코드는 v0.1.4에서 제거했습니다.
+- A/B 모두 세 번째 post-move key부터 `pending-intended-key`가 기존 intended range를 raw Jamo로 덮어쓰는 regression을 보였습니다.
+- 현재 repair는 stale prefix를 제거할 수 있는 첫 단계 뒤, iPadOS가 준 `beforeinput.data`가 현재 목적지 음절의 연결된 rewrite임을 증명할 수 있을 때 그 native text를 사용합니다. 임의 Hangul composer나 keyboard-layout 변환은 사용하지 않습니다.
+- 증명할 수 없는 실제 Korean key는 기존 intended text를 덮어쓰지 않고 현재 cursor에 보존합니다.
 
 ## 확인된 root cause
 
@@ -56,7 +65,7 @@ v0.1.3은 기존 repair를 유지하면서 native IME stale state를 focus cycle
 8. source Hangul이 원래 range에 여전히 존재하고, 목적 selection은 collapsed 상태임
 9. Space, Enter, 영어, 숫자, 기호, 한영 전환, 외부 blur, 실제 composition 시작, range selection, undo/redo가 없었음
 
-처음 Hangul insertion 한 번이나 rewrite 한 번만으로는 reset/repair 후보가 되지 않습니다. 같은 위치에서 계속되는 정상 `가 → 각 → 간`, 의도적인 동일 음절 입력, 일반 Backspace에는 개입하지 않습니다.
+처음 Hangul insertion 한 번이나 rewrite 한 번만으로는 repair 후보가 되지 않습니다. 같은 위치에서 계속되는 정상 `가 → 각 → 간`, 의도적인 동일 음절 입력, 일반 Backspace에는 개입하지 않습니다.
 
 상태는 마지막 active tail만 저장합니다.
 
@@ -71,28 +80,11 @@ idle
                  └─ destructive delete + stale insert → atomic repair
 ```
 
-## Experimental native reset 진단
+## Experimental reset A/B 결론
 
-Settings의 **Experimental IME reset on cursor move**는 기본 OFF인 iOS/iPadOS 전용 진단 옵션입니다. 정상 Korean pseudo-composition rewrite가 최소 두 번 확인된 뒤 selection이 active range 밖으로 이동한 경우에만 다음 순서를 실행합니다.
+B/ON trace의 focus cycle 네 번은 각각 4–15ms에 완료됐고 `selection-before == selection-after`, `document-unchanged: true`, 동일 scroll/viewport를 기록했습니다. 그러나 마지막 focus 뒤 첫 Korean key까지 249ms 및 410ms가 지난 뒤에도 `deleteContentBackward`와 stale `락`이 발생했습니다. 이후 모든 key에서도 같은 stale rewrite가 이어졌습니다.
 
-1. 전체 CM selection, document snapshot, editor/window scroll, visual viewport 높이를 저장합니다.
-2. `EditorView.contentDOM.blur()`를 호출합니다.
-3. 한 번의 `requestAnimationFrame` boundary 뒤 `contentDOM.focus({preventScroll: true})`를 호출하고, 지원하지 않으면 인자 없는 `focus()`로 fallback합니다.
-4. document가 그대로인데 CM selection만 변했다면 공개 transaction으로 selection을 복원합니다. 이 transaction은 `Transaction.addToHistory.of(false)`이며 document change가 없습니다.
-5. reset 뒤 첫 Korean keydown과 DOM/CM delete·insert 흐름을 기록합니다. `deleteContentBackward + stale insert`가 다시 발생하지 않은 경우에만 실기 로그를 reset 성공의 증거로 판단합니다.
-
-코드는 focus가 돌아오고 document가 보존된 사실만 `reset-success-candidate`로 기록합니다. native IME state를 읽을 API가 없으므로 이것을 reset 성공으로 간주하지 않으며 `native-ime-reset-confirmed`는 항상 `false`입니다.
-
-공개 API와 engine 동작을 조사한 결과는 다음과 같습니다.
-
-- CM6의 [`EditorView.composing`/`compositionStarted`](https://codemirror.net/docs/ref/#view.EditorView.composing)는 읽기 전용 상태이며 native composition을 commit/reset하는 공개 command는 없습니다.
-- CM6의 [input implementation](https://github.com/codemirror/view/blob/main/src/input.ts)은 focus/blur를 관찰해 optional focus-change effect transaction 또는 view update를 알리고 editor scroll을 복원합니다. 이 경로는 document를 바꾸지 않으며, 실험의 selection 복원은 플러그인이 공개 dispatch와 `addToHistory(false)`로 명시적으로 처리합니다.
-- CM6가 즉시 blur/focus를 순환하는 코드는 [Chrome Android의 uneditable node/virtual keyboard 복구](https://github.com/codemirror/view/blob/main/src/docview.ts)에 한정됩니다. 이 선례는 focus cycling이 가능한 공개 DOM 동작임을 보여줄 뿐, iPadOS Korean IME reset 효과를 증명하지 않습니다.
-- HTML focus 알고리즘의 `preventScroll`은 focus로 인한 scroll만 억제합니다. selection 또는 software keyboard 상태 보존을 보장하지 않으므로 전후 scroll/viewport를 별도로 기록합니다.
-- WebKit은 contenteditable selection을 input/textarea와 다르게 보존합니다([FocusController.cpp](https://github.com/WebKit/WebKit/blob/main/Source/WebCore/page/FocusController.cpp)). iOS WebKit 내부에는 blur/refocus 뒤 input context를 갱신하는 경로가 있지만 웹 콘텐츠에 native marked/pseudo state를 확인하거나 폐기하는 API는 노출되지 않습니다.
-- 외장 물리키보드에서는 blur가 input context를 재생성해 stale state를 끝낼 가능성이 있지만 실기 검증이 필요합니다. software keyboard가 표시된 경우에는 keyboard dismiss/reopen, viewport resize, focus flicker 가능성이 있으므로 옵션은 기본 OFF이며 scroll과 visual viewport를 기록합니다.
-
-`contenteditable` toggle, CM private `inputState` 수정, synthetic `compositionend`, DOM document mutation, 숨은 Space/Enter 삽입은 사용하지 않습니다.
+따라서 focus 복귀를 뜻하는 과거의 `reset-success-candidate`는 native reset 성공과 무관했습니다. v0.1.4는 이 실험을 production 후보로 발전시키지 않으며 `contentDOM.blur()/focus()`를 호출하지 않습니다. CM6/WebKit에는 이 pseudo state를 읽거나 종료하는 공개 API가 확인되지 않았으므로 결과 repair만 강한 trace 증거 아래 수행합니다.
 
 ## 선택한 atomic repair
 
@@ -100,14 +92,15 @@ Settings의 **Experimental IME reset on cursor move**는 기본 OFF인 iOS/iPadO
 
 1. 이동 목적지에서 Hangul `keydown.key` 직후 `deleteContentBackward`가 발생합니다.
 2. 기본 transaction이 `input.type`의 단일 backward deletion이고, source pseudo text가 원래 위치에 남아 있으며, range/time/selection 조건이 모두 맞으면 destructive deletion을 document와 history에 들어가기 전에 막습니다. 목적지의 정상 문자는 그대로 보존됩니다.
-3. 바로 이어지는 `insertText`가 stale source와 실제 `keydown.key`의 결합임을 증명할 수 있을 때만 stale insertion 대신 의도 문자열을 한 개의 `input.type` CM transaction으로 적용합니다.
+3. 바로 이어지는 `insertText`가 stale source와 실제 `keydown.key`의 결합임을 증명할 수 있을 때 stale prefix를 제거한 의도 문자열을 한 개의 `input.type` CM transaction으로 적용합니다.
    - `휴 + 실제 key ㅇ → 흉`: Unicode 음절 구조로 final attachment가 정확히 일치하므로 의도 입력 `ㅇ`을 사용합니다.
    - 다음 결과가 `휴이`: source `휴`가 정확한 prefix이므로 검증된 suffix `이`로 앞의 임시 `ㅇ` range를 교체합니다.
 4. 이때 `keyCode`를 두벌식 Jamo로 변환하지 않습니다. 브라우저가 준 실제 `keydown.key`와 `beforeinput.data`만 사용합니다.
-5. stale insertion에서 완성 문자열을 증명할 수 없더라도, 같은 delete pair를 시작한 `keydown.key`가 modifier 없는 단일 Korean input임이 이미 확인됐다면 그 실제 key를 `pending-intended-key`로 보존합니다. 임의 Hangul composition은 하지 않으며, 다음 rewrite에서 검증된 suffix가 나오면 기존 intended range만 교체합니다.
-6. atomic repair 뒤 selection이 다시 이동하면 이전 `intended.range`를 폐기하고 새 destination을 guard합니다.
+5. stale prefix가 더 이상 나타나지 않는 후속 단계에서는, `beforeinput.data`가 방금 목적지에서 삭제하려 한 intended tail의 연결된 Hangul rewrite인지 검증합니다. 예를 들어 `가 → 간 → 가나`, `나 → 낟 → 나다`가 실제 native data와 일치할 때만 해당 tail을 교체합니다.
+6. 완성 문자열을 증명할 수 없더라도 modifier 없는 단일 Korean `keydown.key`는 버리지 않습니다. 다만 기존 intended range를 raw Jamo로 덮어쓰지 않고 cursor에 추가해 기존 문서를 보존합니다.
+7. atomic repair 뒤 selection이 다시 이동하면 이전 `intended.range`를 폐기하고 새 destination을 guard합니다.
 
-단순 시간 경과만으로 moved guard를 해제하지 않습니다. Space/Enter/Tab/Escape/Backspace/Delete, 영어·숫자·기호, 알려진 input mode 전환 key, non-Hangul `beforeinput`, 외부 blur, 실제 composition event, range selection, undo/redo, 관련 없는 document transaction을 명시적인 종료 조건으로 사용합니다. reset 실험의 blur/focus는 성공을 가정하지 않으므로 이미 만들어진 moved guard를 첫 입력 검증까지 유지합니다.
+단순 시간 경과만으로 moved guard를 해제하지 않습니다. Space/Enter/Tab/Escape/Backspace/Delete, 영어·숫자·기호, 알려진 input mode 전환 key, non-Hangul `beforeinput`, 외부 blur, 실제 composition event, range selection, undo/redo, 관련 없는 document transaction을 명시적인 종료 조건으로 사용합니다.
 
 삭제 뒤 잘못된 글자를 사후 삭제하는 방식이 아니므로 `랜더링 → 랜흉링` 같은 중간 document state가 CM history에 들어가지 않습니다. 정상 문자는 유지되고, 검증된 의도 입력만 일반 `input.type` history step으로 남습니다. selection은 그 transaction의 새 입력 끝으로 명시됩니다.
 
@@ -123,8 +116,9 @@ Debug OFF에서는 snippet 생성이나 JSON 직렬화를 하지 않습니다. O
 - `pseudoComposition.lastRewriteTime`
 - `pseudoComposition.rewriteCount`
 - `selectionMovedOutsidePseudoRange`
+- `movedGuard.sourceRange/sourceText/destination/intendedRange/intendedText`
 
-판정 과정은 `reset-attempt`, `stale-rewrite-detected`, `stale-rewrite-suppressed`, `atomic-repair`로 확인할 수 있습니다. 실험 옵션 ON에서는 `ime-reset-attempt`, `ime-reset-blur`, `ime-reset-focus`, `ime-reset-first-input-trace`가 selection/scroll 전후, reset latency, success candidate, 첫 Korean 입력의 delete/insert 및 repair 판정을 기록합니다.
+판정 과정은 `pseudo-moved-guard-armed`, `stale-rewrite-detected`, `stale-rewrite-suppressed`, `atomic-repair`로 확인할 수 있습니다. `atomic-repair.details.intendedTextSource`는 stale prefix 제거면 `derived`, 검증된 native continuation이면 `native-rewrite`, 증명 불가 key 보존이면 `pending-intended-key`입니다.
 
 ## 안전 범위와 남은 위험
 
@@ -138,10 +132,9 @@ Debug OFF에서는 snippet 생성이나 JSON 직렬화를 하지 않습니다. O
 남은 위험은 다음과 같습니다.
 
 - 실제 iPad에서 input handler가 destructive deletion과 insertion 사이에 DOM selection을 어떤 순서로 resync하는지는 확인이 필요합니다.
-- unprovable stale 변형은 브라우저가 반환한 합성 결과 대신 검증된 실제 Korean key 하나만 보존하므로 순간적으로 Jamo가 보일 수 있습니다.
+- unprovable stale 변형은 기존 intended text 뒤에 실제 Korean key 하나를 보존하므로 순간적으로 Jamo가 보일 수 있습니다. 기존 intended text나 목적지 문자를 추측해 덮어쓰지는 않습니다.
 - 80ms/160ms의 delete/insert association 제한 밖의 매우 느린 event delivery는 놓칠 수 있습니다.
 - 명시적인 boundary 없이 오래 유지된 confirmed session은 시간만으로 만료하지 않습니다. 오판 시에도 기존 문서를 삭제하지 않는 조건을 우선합니다.
-- experimental blur/focus는 software keyboard를 닫거나 다시 띄우고 viewport/scroll/focus를 흔들 수 있습니다.
 - 복합 Jamo, 세벌식, 특수 입력 source처럼 실제 key/data가 다른 경로는 안전을 위해 repair하지 않을 수 있습니다.
 - Obsidian에 내장된 CM 버전별 DOM diff range 차이는 실제 앱에서 검증해야 합니다.
 
@@ -173,13 +166,13 @@ dist/korean-render/          → <Vault>/.obsidian/plugins/korean-render/
   manifest.json
 ```
 
-Settings에는 **Enable Korean Render**(기본 ON), **Debug logging**(기본 OFF), **Experimental IME reset on cursor move**(기본 OFF)가 있습니다. 실험 reset은 iOS/iPadOS에서만 실행됩니다.
+Settings에는 **Enable Korean Render**(기본 ON), **Debug logging**(기본 OFF)가 있습니다.
 Debug logging을 OFF에서 ON으로 켜면 이전 session의 in-memory log를 먼저 비웁니다.
 Command Palette의 **Korean Render: Clear debug log**는 ring buffer만 즉시 비우며 document와 pseudo-composition state는 변경하지 않습니다. **Copy debug log**는 복사 뒤 log를 자동 삭제하지 않습니다.
 
 ## 실제 iPadOS 검증 절차
 
-중요한 note가 아닌 새 test vault/note에서 먼저 실행하십시오. experimental reset이 native IME에서 확인되기 전에는 원본 note의 backup을 권장합니다.
+중요한 note가 아닌 새 test vault/note에서 먼저 실행하고 원본 note는 backup한 뒤 검증하십시오.
 
 1. iPadOS 기본 Korean IME와 문제를 재현한 Bluetooth keyboard를 연결합니다.
 2. Obsidian Mobile을 Live Preview로 두고 Korean Render ON, Debug logging ON으로 설정합니다.
@@ -197,22 +190,19 @@ Command Palette의 **Korean Render: Clear debug log**는 ring buffer만 즉시 �
 14. 각 경우 뒤 Undo/Redo를 반복해 정상 원문, 새 입력, selection 순서에 이상한 중간 상태가 없는지 확인합니다.
 15. 다른 위치에서 의도적으로 앞과 동일한 음절을 다시 입력합니다.
 16. 긴 note에서 wikilink, callout, image/embed 앞뒤와 viewport 밖에서 같은 절차를 반복하고 scroll/focus가 튀지 않는지 확인합니다.
-17. 성공 직후 **Korean Render: Copy debug log**를 실행해 `reset-attempt` 뒤 정상 insertion 또는 `stale-rewrite-detected → stale-rewrite-suppressed → atomic-repair` 순서가 있는지 확인합니다.
+17. 성공 직후 **Korean Render: Copy debug log**를 실행해 `pseudo-moved-guard-armed` 뒤 정상 insertion 또는 `stale-rewrite-detected → stale-rewrite-suppressed → atomic-repair` 순서가 있는지 확인합니다.
 18. 실패했다면 문서의 실제 결과, Obsidian/iPadOS version, iPad/keyboard model, 입력 source, 방향키/터치 여부와 함께 JSON Lines 전체를 전달하십시오.
 
-### Experimental reset A/B
+### A/B trace 기반 회귀 시나리오
 
-중요하지 않은 동일한 test note와 동일한 외장 키보드를 사용합니다.
+중요하지 않은 test note와 동일한 외장 키보드를 사용합니다.
 
-1. **Experimental IME reset on cursor move**를 OFF로 둡니다.
-2. Debug logging을 켜고 **Korean Render: Clear debug log**를 실행합니다.
-3. 기준 문장을 입력하고, 동일한 방향키/터치 이동과 동일한 Korean key 순서로 기존 문제를 재현합니다.
-4. debug log와 실제 document 결과를 보관합니다.
-5. 실험 옵션을 ON으로 바꾸고 **Korean Render: Clear debug log**를 다시 실행합니다.
-6. 같은 문장, 같은 cursor 이동, 같은 key 순서를 반복합니다.
-7. `ime-reset-attempt → ime-reset-blur → ime-reset-focus` 뒤 첫 `ime-reset-first-input-trace`를 비교합니다.
-8. 첫 Korean 입력에서 `deleteContentBackward`와 stale rewrite가 다시 나타났는지, selection/scroll/visual viewport가 변했는지, software keyboard가 깜박이거나 닫혔는지 기록합니다.
-9. `reset-success-candidate: true`만으로 성공 판정하지 않습니다. OFF에서는 발생했던 stale delete/rewrite가 ON의 동일 입력에서 사라졌을 때만 native reset 성공 후보로 해석합니다.
+1. `가나다라`를 입력하고 마지막 `라`가 active tail인 상태에서 ArrowLeft를 두 번 눌러 `나|다`로 이동합니다.
+2. `ㄱ, ㅏ, ㄴ, ㅏ, ㄷ, ㅏ, ㄹ, ㅏ` 순서로 입력합니다.
+3. 목적지 앞의 `나`와 원래 source의 `라`가 보존되고, 새 입력이 raw Jamo로 교대로 덮어써지지 않으며 `가나다라`로 조합되는지 확인합니다.
+4. 같은 시나리오를 빠른 방향키 연타와 touch selection으로 각각 반복합니다.
+5. 각 key 뒤 Undo/Redo를 실행해 삭제된 목적지 문자나 stale 문자열이 중간 history state로 나타나지 않는지 확인합니다.
+6. Space/Enter, 영어/숫자/기호, 한영 전환 뒤에는 moved guard가 종료되고 정상 입력에 개입하지 않는지 확인합니다.
 
 민감한 문장이 cursor 가까이에 있다면 log를 보내기 전에 snippet을 지우십시오.
 
@@ -228,10 +218,10 @@ npm run build
 
 자동 테스트는 다음 불변조건을 고정합니다.
 
-- 기존 document text는 stale repair/reset 때문에 사라지지 않는다.
+- 기존 document text는 stale repair 때문에 사라지지 않는다.
 - modifier 없는 유효한 단일 Korean physical key는 조용히 버려지지 않는다.
-- 차단 및 reset selection 복원은 history에 숨은 document state를 만들지 않는다.
-- reset 전 CM cursor/selection을 유지하고, 필요할 때만 history 없는 공식 dispatch로 복원한다.
+- 차단 및 atomic repair는 history에 destructive intermediate document state를 만들지 않는다.
+- cursor/selection은 사용자가 이동한 destination과 검증된 새 입력 끝을 따른다.
 - 증거가 부족하면 기존 document와 실제 key를 보존하고 진단 정보를 남긴다.
 
 - 실제 composition path: [`src/ime-state-machine.ts`](src/ime-state-machine.ts)

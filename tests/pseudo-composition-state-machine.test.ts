@@ -181,7 +181,7 @@ describe("KoreanPseudoCompositionStateMachine", () => {
     expect(machine.evaluate(transaction(52, 9, 9, "ㅇ", "", cursor(9)))).toEqual({ kind: "allow" });
   });
 
-  it("arms a reset candidate after each arrow direction moves outside the pseudo range", () => {
+  it("arms a moved guard after each arrow direction moves outside the pseudo range", () => {
     for (const destination of [8, 10, 2, 15]) {
       const machine = new KoreanPseudoCompositionStateMachine();
       trainEhyu(machine);
@@ -190,7 +190,7 @@ describe("KoreanPseudoCompositionStateMachine", () => {
     }
   });
 
-  it("arms the same candidate for touch selection", () => {
+  it("arms the same moved guard for touch selection", () => {
     const machine = new KoreanPseudoCompositionStateMachine();
     trainEhyu(machine);
     expect(move(machine, 60, 3, "select.pointer")).toBe(true);
@@ -350,6 +350,28 @@ describe("KoreanPseudoCompositionStateMachine", () => {
     });
   });
 
+  it("appends an unprovable pending key instead of overwriting repaired intended text", () => {
+    const machine = new KoreanPseudoCompositionStateMachine();
+    trainEhyu(machine);
+    move(machine);
+    expect(staleDelete(machine, 70, 3, "ㅇ").kind).toBe("suppress-stale-delete");
+    beforeInsert(machine, 73, "흉");
+    const firstRepair = machine.evaluate(transaction(74, 3, 3, "흉", "", cursor(3)));
+    if (firstRepair.kind !== "atomic-repair") throw new Error("expected repair");
+    machine.commitAtomicRepair(firstRepair);
+
+    expect(staleDelete(machine, 80, 4, "ㅣ", "ㅇ").kind).toBe("suppress-stale-delete");
+    beforeInsert(machine, 83, "마");
+    expect(machine.evaluate(transaction(84, 4, 4, "마", "", cursor(4)))).toEqual({
+      kind: "atomic-repair",
+      insert: "ㅣ",
+      replace: { from: 4, to: 4 },
+      staleText: "휴",
+      originalText: "ㅇ",
+      source: "pending-intended-key",
+    });
+  });
+
   it("keeps a confirmed moved guard beyond 1.5 seconds until an explicit boundary", () => {
     const machine = new KoreanPseudoCompositionStateMachine();
     trainEhyu(machine);
@@ -378,17 +400,6 @@ describe("KoreanPseudoCompositionStateMachine", () => {
       kind: "suppress-stale-delete",
       originalText: "나",
     });
-  });
-
-  it("retains a moved guard across a reset candidate but clears the old active tail", () => {
-    const machine = new KoreanPseudoCompositionStateMachine();
-    trainEhyu(machine);
-    move(machine);
-    machine.onResetSuccessCandidate();
-
-    expect(machine.getDebugSnapshot().pseudoComposition.active).toBe(false);
-    expect(machine.getDebugSnapshot().selectionMovedOutsidePseudoRange).toBe(true);
-    expect(staleDelete(machine, 5_000, 3, "ㅇ").kind).toBe("suppress-stale-delete");
   });
 
   it("ends the session on an external focus boundary", () => {

@@ -36,7 +36,7 @@ export type PseudoDecision =
       replace: TextRange;
       staleText: string;
       originalText: string;
-      source: "derived" | "pending-intended-key";
+      source: "derived" | "native-rewrite" | "pending-intended-key";
     }
 
 export type AtomicRepairDecision = Extract<PseudoDecision, { kind: "atomic-repair" }>;
@@ -50,6 +50,13 @@ export interface PseudoDebugSnapshot {
     rewriteCount: number;
   };
   selectionMovedOutsidePseudoRange: boolean;
+  movedGuard: {
+    sourceRange: TextRange;
+    sourceText: string;
+    destination: SelectionSnapshot;
+    intendedRange: TextRange | null;
+    intendedText: string;
+  } | null;
 }
 
 interface PendingDelete {
@@ -208,6 +215,11 @@ function attachFinalConsonant(staleText: string, key: string): string | undefine
   return String.fromCodePoint(0xac00 + parts.lead * 588 + parts.vowel * 28 + final);
 }
 
+function isDirectHangulRewrite(previous: string, inserted: string): boolean {
+  const first = Array.from(inserted)[0];
+  return first !== undefined && isConnectedHangulRewrite(previous, first);
+}
+
 function recent(signalAt: number, eventAt: number | undefined, windowMs: number): boolean {
   return eventAt !== undefined && signalAt >= eventAt && signalAt - eventAt <= windowMs;
 }
@@ -226,10 +238,10 @@ function languageSwitchKey(key: string): boolean {
 
 /**
  * Tracks iOS Korean's composition-less deleteBackward/insertText rewrites.
- * It only becomes reset/repair eligible after two consecutive rewrites of the
+ * It only becomes repair eligible after two consecutive rewrites of the
  * exact active tail. Once a stale destructive delete is proven, the original
- * document character is preserved and an underivable stale insertion falls
- * back only to the trusted single Korean key that initiated the pair.
+ * document character is preserved. An underivable stale insertion appends
+ * only the trusted single Korean key instead of overwriting intended text.
  */
 export class KoreanPseudoCompositionStateMachine {
   private active = false;
@@ -249,21 +261,6 @@ export class KoreanPseudoCompositionStateMachine {
 
   onExternalFocusBoundary(): void {
     this.clear();
-  }
-
-  /**
-   * A plugin-initiated blur/focus is only a reset candidate. Stop using the
-   * old tail to arm new guards, but retain an already moved guard until the
-   * first post-reset input proves whether native state was actually cleared.
-   */
-  onResetSuccessCandidate(): void {
-    this.active = false;
-    this.lastRange = undefined;
-    this.lastText = "";
-    this.lastRewriteTime = 0;
-    this.rewriteCount = 0;
-    this.pendingDelete = undefined;
-    this.pendingStaleDelete = undefined;
   }
 
   onKeyDown(signal: KeySignal): void {
@@ -382,6 +379,7 @@ export class KoreanPseudoCompositionStateMachine {
   commitAtomicRepair(decision: AtomicRepairDecision): void {
     const moved = this.moved;
     if (!moved) return;
+    const previousIntended = moved.intended;
     const replacedLength = decision.replace.to - decision.replace.from;
     const delta = decision.insert.length - replacedLength;
     if (decision.replace.to <= moved.sourceRange.from) {
@@ -393,10 +391,29 @@ export class KoreanPseudoCompositionStateMachine {
       this.clear();
       return;
     }
-    moved.intended = {
-      range: { from: decision.replace.from, to: decision.replace.from + decision.insert.length },
-      text: decision.insert,
-    };
+    if (
+      previousIntended &&
+      decision.replace.from >= previousIntended.range.from &&
+      decision.replace.to <= previousIntended.range.to
+    ) {
+      const relativeFrom = decision.replace.from - previousIntended.range.from;
+      const relativeTo = decision.replace.to - previousIntended.range.from;
+      moved.intended = {
+        range: {
+          from: previousIntended.range.from,
+          to: previousIntended.range.to + delta,
+        },
+        text:
+          previousIntended.text.slice(0, relativeFrom) +
+          decision.insert +
+          previousIntended.text.slice(relativeTo),
+      };
+    } else {
+      moved.intended = {
+        range: { from: decision.replace.from, to: decision.replace.from + decision.insert.length },
+        text: decision.insert,
+      };
+    }
     moved.destination = {
       from: moved.intended.range.to,
       to: moved.intended.range.to,
@@ -420,6 +437,15 @@ export class KoreanPseudoCompositionStateMachine {
         rewriteCount: this.rewriteCount,
       },
       selectionMovedOutsidePseudoRange: this.moved !== undefined,
+      movedGuard: this.moved
+        ? {
+            sourceRange: { ...this.moved.sourceRange },
+            sourceText: this.moved.sourceText,
+            destination: { ...this.moved.destination },
+            intendedRange: this.moved.intended ? { ...this.moved.intended.range } : null,
+            intendedText: this.moved.intended?.text ?? "",
+          }
+        : null,
     };
   }
 
@@ -439,11 +465,17 @@ export class KoreanPseudoCompositionStateMachine {
       recent(signal.at, keydown.at, PSEUDO_INPUT_ASSOCIATION_MS);
 
     if (this.moved) {
-      const expectedRange = this.moved.intended?.range;
+      const intended = this.moved.intended;
       const atDestination = sameSelection(signal.selectionBefore, this.moved.destination);
-      const exactContinuationDelete = expectedRange
-        ? sameRange(expectedRange, { from: signal.from, to: signal.to }) &&
-          signal.deletedText === this.moved.intended?.text
+      const exactContinuationDelete = intended
+        ? signal.from >= intended.range.from &&
+          signal.to === intended.range.to &&
+          signal.from < signal.to &&
+          signal.deletedText ===
+            intended.text.slice(
+              signal.from - intended.range.from,
+              signal.to - intended.range.from,
+            )
         : signal.to === signal.selectionBefore.to &&
           signal.from < signal.to &&
           oneCodePoint(signal.deletedText) &&
@@ -519,19 +551,22 @@ export class KoreanPseudoCompositionStateMachine {
         this.moved.sourceText,
         pending.intendedKey,
         signal.insert,
+        pending.originalText,
+        this.moved.intended !== undefined,
       );
-      const replace = this.moved.intended?.range ?? {
-        from: this.moved.destination.from,
-        to: this.moved.destination.to,
-      };
+      const replace = intended
+        ? this.moved.intended
+          ? pending.range
+          : { from: this.moved.destination.from, to: this.moved.destination.to }
+        : { from: this.moved.destination.from, to: this.moved.destination.to };
       this.pendingStaleDelete = undefined;
       return {
         kind: "atomic-repair",
-        insert: intended ?? pending.intendedKey,
+        insert: intended?.text ?? pending.intendedKey,
         replace,
         staleText: this.moved.sourceText,
         originalText: pending.originalText,
-        source: intended ? "derived" : "pending-intended-key",
+        source: intended?.source ?? "pending-intended-key",
       };
     }
 
@@ -578,13 +613,25 @@ export class KoreanPseudoCompositionStateMachine {
     return { kind: "allow" };
   }
 
-  private deriveIntendedText(staleText: string, key: string, inserted: string): string | undefined {
+  private deriveIntendedText(
+    staleText: string,
+    key: string,
+    inserted: string,
+    replacedText: string,
+    hasIntendedText: boolean,
+  ): { text: string; source: "derived" | "native-rewrite" } | undefined {
     if (!isHangulInputKey(key)) return undefined;
+    if (hasIntendedText && isDirectHangulRewrite(replacedText, inserted)) {
+      return { text: inserted, source: "native-rewrite" };
+    }
     if (inserted.startsWith(staleText)) {
       const suffix = inserted.slice(staleText.length);
-      return isHangulText(suffix) ? suffix : undefined;
+      return isHangulText(suffix) ? { text: suffix, source: "derived" } : undefined;
     }
-    return attachFinalConsonant(staleText, key) === inserted ? key : undefined;
+    if (attachFinalConsonant(staleText, key) === inserted) {
+      return { text: key, source: "derived" };
+    }
+    return undefined;
   }
 
   private clear(): void {
