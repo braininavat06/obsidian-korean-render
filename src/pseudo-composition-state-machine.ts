@@ -44,7 +44,7 @@ export type PseudoDecision =
       range: TextRange;
       repairRange: TextRange;
       staleText: string;
-      deleteSource: "exact-continuation" | "shifted-native-tail";
+      deleteSource: "exact-continuation" | "shifted-native-tail" | "protected-document" | "backspace-rewind-spill";
     }
   | {
       kind: "atomic-repair";
@@ -75,6 +75,12 @@ export interface PseudoDebugSnapshot {
     guardConfidence: GuardConfidence | null;
     singleRewriteLineage: SingleRewriteLineageSnapshot | null;
   };
+  nativeBackspaceRewind: {
+    phase: NativeBackspacePhase;
+    keyAt: number;
+    mutableRange: TextRange;
+    mutableText: string;
+  } | null;
   selectionMovedOutsidePseudoRange: boolean;
   movedGuard: {
     protectedSourceRange: TextRange;
@@ -101,6 +107,7 @@ interface PendingDelete {
   range: TextRange;
   text: string;
   initialFragment?: InitialFragmentCandidate;
+  trigger?: "korean-key" | "backspace-rewind";
 }
 
 type GuardConfidence = "multi-rewrite" | "single-confirmed-lineage";
@@ -129,8 +136,31 @@ interface PendingStaleDelete {
   attemptedRange: TextRange;
   repairRange: TextRange;
   intendedKey: string;
-  deleteSource: "exact-continuation" | "shifted-native-tail";
+  deleteSource: "exact-continuation" | "shifted-native-tail" | "protected-document";
+  initialFragment?: InitialFragmentCandidate;
 }
+
+type NativeBackspacePhase = "armed" | "delete-accepted" | "rewrite-completed" | "spill-suppressed";
+
+interface NativeBackspaceRewind {
+  keyAt: number;
+  selection: SelectionSnapshot;
+  mutableRange: TextRange;
+  mutableText: string;
+  phase: NativeBackspacePhase;
+  spillAt?: number;
+}
+
+type PendingAtomicHandoff =
+  | { kind: "seed"; insertedAt: number; key: string }
+  | {
+      kind: "confirm";
+      candidate: InitialFragmentCandidate;
+      deletedRange: TextRange;
+      deletedText: string;
+      deletedAt: number;
+      replacementAt: number;
+    };
 
 interface MovedPseudoComposition {
   protectedSourceRange: TextRange;
@@ -374,7 +404,7 @@ function inputTypeEvent(userEvent: string | undefined): boolean {
 }
 
 function naturalBoundaryKey(key: string): boolean {
-  return [" ", "Spacebar", "Enter", "Tab", "Escape", "Backspace", "Delete"].includes(key);
+  return [" ", "Spacebar", "Enter", "Tab", "Escape", "Delete"].includes(key);
 }
 
 function languageSwitchKey(key: string): boolean {
@@ -405,6 +435,9 @@ export class KoreanPseudoCompositionStateMachine {
   private singleRewriteLineage: SingleRewriteLineageSnapshot | undefined;
   private pendingSelectionDeleteKey: PendingSelectionDeleteKey | undefined;
   private pendingPostDeleteReplayGuard: PendingPostDeleteReplayGuard | undefined;
+  private pendingAtomicHandoff: PendingAtomicHandoff | undefined;
+  private nativeBackspaceRewind: NativeBackspaceRewind | undefined;
+  private preserveNextMovedDocumentTransaction = false;
   private readonly diagnostics: PseudoDiagnostic[] = [];
 
   onRealCompositionEvent(): void {
@@ -451,11 +484,34 @@ export class KoreanPseudoCompositionStateMachine {
       this.keydown = signal;
       return;
     }
+    if (signal.key === "Backspace") {
+      const mutable = selection && collapsed(selection) ? this.currentMutableTail() : undefined;
+      if (
+        mutable &&
+        selection &&
+        sameSelection(selection, cursorAt(mutable.range.to))
+      ) {
+        this.nativeBackspaceRewind = {
+          keyAt: signal.at,
+          selection: { ...selection },
+          mutableRange: { ...mutable.range },
+          mutableText: mutable.text,
+          phase: "armed",
+        };
+        this.pendingDelete = undefined;
+        this.pendingStaleDelete = undefined;
+        return;
+      }
+      this.clearCompositionState();
+      this.keydown = signal;
+      return;
+    }
     if (naturalBoundaryKey(signal.key) || languageSwitchKey(signal.key)) {
       this.clearCompositionState();
       this.keydown = signal;
       return;
     }
+    this.nativeBackspaceRewind = undefined;
     if (signal.key.length === 1 && !isHangulInputKey(signal.key)) {
       this.clearCompositionState();
       this.keydown = signal;
@@ -494,6 +550,7 @@ export class KoreanPseudoCompositionStateMachine {
   onSelectionMove(signal: SelectionMoveSignal): boolean {
     this.expirePostDeleteReplayGuard(signal.at);
     this.pendingSelectionDeleteKey = undefined;
+    this.nativeBackspaceRewind = undefined;
     this.disarmPostDeleteReplayGuard("selection-change");
     if (
       signal.origin === "other" ||
@@ -509,6 +566,30 @@ export class KoreanPseudoCompositionStateMachine {
       this.moved &&
       sameSelection(signal.before, this.moved.destination)
     ) {
+      const confirmedHandoff =
+        this.active &&
+        this.rewriteCount === 1 &&
+        this.singleRewriteLineage !== undefined &&
+        this.lastRange !== undefined &&
+        sameRange(this.lastRange, this.singleRewriteLineage.replacementRange) &&
+        this.lastText === this.singleRewriteLineage.replacementText &&
+        signal.before.to === this.lastRange.to &&
+        signal.textBeforeCursor.endsWith(this.lastText);
+      if (confirmedHandoff && this.lastRange && this.singleRewriteLineage) {
+        this.moved = {
+          protectedSourceRange: { ...this.lastRange },
+          protectedSourceText: this.lastText,
+          nativeTailRange: { ...this.lastRange },
+          nativeTailText: this.lastText,
+          destination: signal.after,
+          guardConfidence: "single-confirmed-lineage",
+          singleRewriteLineage: copyLineage(this.singleRewriteLineage),
+        };
+        this.initialFragmentCandidate = undefined;
+        this.pendingDelete = undefined;
+        this.pendingStaleDelete = undefined;
+        return true;
+      }
       this.moved.destination = signal.after;
       this.moved.intended = undefined;
       this.pendingStaleDelete = undefined;
@@ -619,12 +700,14 @@ export class KoreanPseudoCompositionStateMachine {
     preserveMovedGuard = false,
   ): void {
     if (!docChanged) return;
+    const preserveLifecycle = this.preserveNextMovedDocumentTransaction;
+    this.preserveNextMovedDocumentTransaction = false;
     this.disarmPostDeleteReplayGuard(
       userEvent === "undo" || userEvent === "redo"
         ? userEvent
         : "other-document-transaction",
     );
-    if (this.moved && !preserveMovedGuard) {
+    if (this.moved && !preserveMovedGuard && !preserveLifecycle) {
       this.clearCompositionState();
       return;
     }
@@ -634,6 +717,23 @@ export class KoreanPseudoCompositionStateMachine {
   }
 
   onAppliedTransaction(signal: AppliedTransactionSignal): void {
+    const rewind = this.nativeBackspaceRewind;
+    if (
+      rewind?.phase === "delete-accepted" &&
+      signal.docChanged &&
+      signal.changeCount === 1 &&
+      signal.from === rewind.mutableRange.from &&
+      signal.to === rewind.mutableRange.to &&
+      signal.insert === ""
+    ) {
+      this.active = false;
+      this.lastRange = undefined;
+      this.lastText = "";
+      this.lastRewriteTime = 0;
+      this.rewriteCount = 0;
+      this.moved = undefined;
+      this.clearSingleRewriteEvidence();
+    }
     const pending = this.pendingSelectionDeleteKey;
     this.pendingSelectionDeleteKey = undefined;
     if (
@@ -680,6 +780,8 @@ export class KoreanPseudoCompositionStateMachine {
   commitAtomicRepair(decision: AtomicRepairDecision): void {
     const moved = this.moved;
     if (!moved) return;
+    const handoff = this.pendingAtomicHandoff;
+    this.pendingAtomicHandoff = undefined;
     const previousIntended = moved.intended;
     const replacedLength = decision.replace.to - decision.replace.from;
     const delta = decision.insert.length - replacedLength;
@@ -726,6 +828,67 @@ export class KoreanPseudoCompositionStateMachine {
     };
     moved.nativeTailText = nativeTail;
     this.pendingStaleDelete = undefined;
+
+    if (
+      handoff?.kind === "seed" &&
+      decision.insert === handoff.key &&
+      moved.intended.text.endsWith(handoff.key)
+    ) {
+      const range = {
+        from: moved.intended.range.to - handoff.key.length,
+        to: moved.intended.range.to,
+      };
+      this.active = true;
+      this.lastRange = { ...range };
+      this.lastText = handoff.key;
+      this.lastRewriteTime = handoff.insertedAt;
+      this.rewriteCount = 0;
+      this.initialFragmentCandidate = {
+        insertedAt: handoff.insertedAt,
+        range: { ...range },
+        text: handoff.key,
+        key: handoff.key,
+      };
+      this.singleRewriteLineage = undefined;
+      return;
+    }
+
+    if (
+      handoff?.kind === "confirm" &&
+      oneCodePoint(decision.insert) &&
+      moved.intended.text === decision.insert
+    ) {
+      const replacementRange = { ...moved.intended.range };
+      const lineage: SingleRewriteLineageSnapshot = {
+        initialText: handoff.candidate.text,
+        initialRange: { ...handoff.candidate.range },
+        deletedText: handoff.deletedText,
+        deletedRange: { ...handoff.deletedRange },
+        replacementText: decision.insert,
+        replacementRange,
+        rewriteIntervalMs: handoff.replacementAt - handoff.candidate.insertedAt,
+        deleteInsertIntervalMs: handoff.replacementAt - handoff.deletedAt,
+      };
+      this.active = true;
+      this.lastRange = { ...replacementRange };
+      this.lastText = decision.insert;
+      this.lastRewriteTime = handoff.replacementAt;
+      this.rewriteCount = 1;
+      this.initialFragmentCandidate = undefined;
+      this.singleRewriteLineage = lineage;
+      this.diagnostics.push({
+        eventType: "single-rewrite-lineage-confirmed",
+        details: { ...copyLineage(lineage), lifecycle: "moved-repair-handoff" },
+      });
+      return;
+    }
+
+    this.active = false;
+    this.lastRange = undefined;
+    this.lastText = "";
+    this.lastRewriteTime = 0;
+    this.rewriteCount = 0;
+    this.clearSingleRewriteEvidence();
   }
 
   getSourceGuard(): { range: TextRange; text: string } | undefined {
@@ -780,6 +943,14 @@ export class KoreanPseudoCompositionStateMachine {
             armReason: this.pendingPostDeleteReplayGuard.armReason,
           }
         : null,
+      nativeBackspaceRewind: this.nativeBackspaceRewind
+        ? {
+            phase: this.nativeBackspaceRewind.phase,
+            keyAt: this.nativeBackspaceRewind.keyAt,
+            mutableRange: { ...this.nativeBackspaceRewind.mutableRange },
+            mutableText: this.nativeBackspaceRewind.mutableText,
+          }
+        : null,
     };
   }
 
@@ -797,6 +968,59 @@ export class KoreanPseudoCompositionStateMachine {
       !keydown.ctrlKey &&
       !keydown.metaKey &&
       recent(signal.at, keydown.at, PSEUDO_INPUT_ASSOCIATION_MS);
+
+    const rewind = this.nativeBackspaceRewind;
+    const recentPhysicalBackspace =
+      rewind !== undefined &&
+      keydown?.key === "Backspace" &&
+      !keydown.isComposing &&
+      !keydown.altKey &&
+      !keydown.ctrlKey &&
+      !keydown.metaKey &&
+      recent(signal.at, rewind.keyAt, PSEUDO_INPUT_ASSOCIATION_MS);
+    if (
+      rewind &&
+      recentPhysicalBackspace &&
+      recentDeleteBeforeInput &&
+      signal.docChanged &&
+      signal.sourceStillPresent &&
+      !signal.deletedText.includes("\n")
+    ) {
+      const exactMutableDelete =
+        rewind.phase === "armed" &&
+        sameRange(rewind.mutableRange, { from: signal.from, to: signal.to }) &&
+        signal.deletedText === rewind.mutableText &&
+        sameSelection(signal.selectionBefore, rewind.selection);
+      if (exactMutableDelete) {
+        rewind.phase = "delete-accepted";
+        this.pendingDelete = {
+          at: signal.at,
+          range: { from: signal.from, to: signal.to },
+          text: signal.deletedText,
+          trigger: "backspace-rewind",
+        };
+        this.preserveNextMovedDocumentTransaction = true;
+        return { kind: "allow" };
+      }
+
+      if (
+        rewind.phase !== "armed" &&
+        oneCodePoint(signal.deletedText) &&
+        (signal.to === signal.selectionBefore.to || signal.from === signal.selectionBefore.to)
+      ) {
+        rewind.phase = "spill-suppressed";
+        rewind.spillAt = signal.at;
+        this.pendingDelete = undefined;
+        return {
+          kind: "suppress-stale-delete",
+          originalText: signal.deletedText,
+          range: { from: signal.from, to: signal.to },
+          repairRange: { ...rewind.mutableRange },
+          staleText: rewind.mutableText,
+          deleteSource: "backspace-rewind-spill",
+        };
+      }
+    }
 
     if (this.moved) {
       const intended = this.moved.intended;
@@ -830,6 +1054,18 @@ export class KoreanPseudoCompositionStateMachine {
         signal.deletedText.length === nativeTailLength &&
         signal.deletedText === this.moved.nativeTailText &&
         signal.to <= this.moved.protectedSourceRange.from;
+      const overlapsProtectedSource =
+        signal.from < this.moved.protectedSourceRange.to &&
+        signal.to > this.moved.protectedSourceRange.from;
+      const protectedDocumentDelete =
+        intended === undefined &&
+        !exactContinuationDelete &&
+        !shiftedNativeTailDelete &&
+        oneCodePoint(signal.deletedText) &&
+        this.keydownSelection !== undefined &&
+        sameSelection(this.keydownSelection, this.moved.destination) &&
+        (signal.to === this.moved.destination.to || signal.from === this.moved.destination.to) &&
+        !overlapsProtectedSource;
 
       if (
         recentDeleteBeforeInput &&
@@ -837,19 +1073,30 @@ export class KoreanPseudoCompositionStateMachine {
         signal.docChanged &&
         inputTypeEvent(signal.userEvent) &&
         atDestination &&
-        (exactContinuationDelete || shiftedNativeTailDelete) &&
+        (exactContinuationDelete || shiftedNativeTailDelete || protectedDocumentDelete) &&
         signal.sourceStillPresent &&
         !signal.deletedText.includes("\n")
       ) {
         const deleteSource = shiftedNativeTailDelete
           ? "shifted-native-tail"
-          : "exact-continuation";
+          : protectedDocumentDelete
+            ? "protected-document"
+            : "exact-continuation";
         const repairRange = shiftedNativeTailDelete
           ? { ...this.moved.nativeTailRange }
-          : { from: signal.from, to: signal.to };
+          : protectedDocumentDelete
+            ? { ...this.moved.destination }
+            : { from: signal.from, to: signal.to };
         if (shiftedNativeTailDelete) {
           this.moved.nativeTailRange = { from: signal.from, to: signal.to };
         }
+        const candidate = this.initialFragmentCandidate;
+        const exactInitialFragmentDelete =
+          candidate !== undefined &&
+          exactContinuationDelete &&
+          sameRange(candidate.range, { from: signal.from, to: signal.to }) &&
+          signal.deletedText === candidate.text &&
+          recent(signal.at, candidate.insertedAt, PSEUDO_INPUT_ASSOCIATION_MS);
         this.pendingStaleDelete = {
           at: signal.at,
           originalText: signal.deletedText,
@@ -857,6 +1104,9 @@ export class KoreanPseudoCompositionStateMachine {
           repairRange,
           intendedKey: keydown.key,
           deleteSource,
+          initialFragment: exactInitialFragmentDelete
+            ? { ...candidate, range: { ...candidate.range } }
+            : undefined,
         };
         return {
           kind: "suppress-stale-delete",
@@ -893,6 +1143,7 @@ export class KoreanPseudoCompositionStateMachine {
         at: signal.at,
         range: { from: signal.from, to: signal.to },
         text: signal.deletedText,
+        trigger: "korean-key",
         initialFragment: exactInitialFragmentDelete
           ? { ...candidate, range: { ...candidate.range } }
           : undefined,
@@ -936,6 +1187,62 @@ export class KoreanPseudoCompositionStateMachine {
       this.disarmPostDeleteReplayGuard("non-matching-input-transaction");
     }
 
+    const rewind = this.nativeBackspaceRewind;
+    if (
+      rewind?.phase === "spill-suppressed" &&
+      rewind.spillAt !== undefined &&
+      signal.at - rewind.spillAt <= PSEUDO_REWRITE_PAIR_MS &&
+      recentInsertBeforeInput &&
+      inputTypeEvent(signal.userEvent) &&
+      isHangulText(signal.insert)
+    ) {
+      const decision: PseudoDecision = {
+        kind: "suppress-stale-replay",
+        insert: signal.insert,
+        destination: { ...signal.selectionBefore },
+        armedAt: rewind.keyAt,
+        armReason: "physical-backspace-native-rewind-spill",
+      };
+      this.nativeBackspaceRewind = undefined;
+      return decision;
+    }
+
+    const pendingBackspace =
+      this.pendingDelete?.trigger === "backspace-rewind" ? this.pendingDelete : undefined;
+    if (pendingBackspace) {
+      const connectedReplacement =
+        rewind?.phase === "delete-accepted" &&
+        signal.at - pendingBackspace.at <= PSEUDO_REWRITE_PAIR_MS &&
+        recentInsertBeforeInput &&
+        inputTypeEvent(signal.userEvent) &&
+        signal.from === pendingBackspace.range.from &&
+        signal.from === signal.to &&
+        isConnectedHangulRewrite(pendingBackspace.text, signal.insert);
+      this.pendingDelete = undefined;
+      if (!connectedReplacement || !rewind) {
+        // Without a connected native rewind there is not enough evidence to
+        // discard a real Backspace result. End protection and leave it alone.
+        this.nativeBackspaceRewind = undefined;
+        return { kind: "allow" };
+      }
+
+      const tail = Array.from(signal.insert).at(-1) ?? "";
+      this.active = true;
+      this.lastRange = {
+        from: signal.from + signal.insert.length - tail.length,
+        to: signal.from + signal.insert.length,
+      };
+      this.lastText = tail;
+      this.lastRewriteTime = signal.at;
+      this.rewriteCount = 0;
+      this.clearSingleRewriteEvidence();
+      rewind.phase = "rewrite-completed";
+      rewind.mutableRange = { ...this.lastRange };
+      rewind.mutableText = tail;
+      rewind.selection = cursorAt(this.lastRange.to);
+      return { kind: "allow" };
+    }
+
     if (this.pendingStaleDelete && this.moved) {
       const pending = this.pendingStaleDelete;
       const pairIsImmediate = signal.at - pending.at <= PSEUDO_REWRITE_PAIR_MS;
@@ -965,10 +1272,41 @@ export class KoreanPseudoCompositionStateMachine {
             : pending.repairRange
           : { from: this.moved.destination.from, to: this.moved.destination.to }
         : { from: this.moved.destination.from, to: this.moved.destination.to };
+      const repairedText = intended?.text ?? pending.intendedKey;
+      const candidate = pending.initialFragment;
+      if (
+        candidate &&
+        oneCodePoint(repairedText) &&
+        syllableParts(repairedText) !== undefined &&
+        sameRange(candidate.range, pending.attemptedRange) &&
+        replace.from === candidate.range.from &&
+        isConnectedHangulRewrite(candidate.text, repairedText)
+      ) {
+        this.pendingAtomicHandoff = {
+          kind: "confirm",
+          candidate: { ...candidate, range: { ...candidate.range } },
+          deletedRange: { ...pending.attemptedRange },
+          deletedText: pending.originalText,
+          deletedAt: pending.at,
+          replacementAt: signal.at,
+        };
+      } else if (
+        repairedText === pending.intendedKey &&
+        isCompatibilityLead(repairedText) &&
+        oneCodePoint(repairedText)
+      ) {
+        this.pendingAtomicHandoff = {
+          kind: "seed",
+          insertedAt: signal.at,
+          key: pending.intendedKey,
+        };
+      } else {
+        this.pendingAtomicHandoff = undefined;
+      }
       this.pendingStaleDelete = undefined;
       return {
         kind: "atomic-repair",
-        insert: intended?.text ?? pending.intendedKey,
+        insert: repairedText,
         replace,
         staleText: this.moved.nativeTailText,
         originalText: pending.originalText,
@@ -1098,7 +1436,11 @@ export class KoreanPseudoCompositionStateMachine {
     ) {
       return { text: inserted, source: "native-rewrite", replaceWholeIntended: true };
     }
-    if (intendedText !== undefined && isDirectHangulRewrite(replacedText, inserted)) {
+    if (
+      intendedText !== undefined &&
+      (oneCodePoint(inserted) || replacedText === nativeTailText) &&
+      isDirectHangulRewrite(replacedText, inserted)
+    ) {
       return { text: inserted, source: "native-rewrite" };
     }
     for (const carry of new Set([nativeTailText, protectedSourceText])) {
@@ -1108,6 +1450,9 @@ export class KoreanPseudoCompositionStateMachine {
         return { text: key, source: "derived" };
       }
     }
+    if (intendedText !== undefined && isDirectHangulRewrite(replacedText, inserted)) {
+      return { text: inserted, source: "native-rewrite" };
+    }
     return undefined;
   }
 
@@ -1115,6 +1460,23 @@ export class KoreanPseudoCompositionStateMachine {
     if (this.pendingPostDeleteReplayGuard && at > this.pendingPostDeleteReplayGuard.expiresAt) {
       this.disarmPostDeleteReplayGuard("timeout");
     }
+  }
+
+  private currentMutableTail(): { range: TextRange; text: string } | undefined {
+    const intended = this.moved?.intended;
+    if (intended && intended.text.length > 0) {
+      const text = Array.from(intended.text).at(-1) ?? "";
+      return text
+        ? {
+            range: { from: intended.range.to - text.length, to: intended.range.to },
+            text,
+          }
+        : undefined;
+    }
+    if (this.active && this.lastRange && this.lastText) {
+      return { range: { ...this.lastRange }, text: this.lastText };
+    }
+    return undefined;
   }
 
   private disarmPostDeleteReplayGuard(reason: string): void {
@@ -1140,6 +1502,9 @@ export class KoreanPseudoCompositionStateMachine {
     this.rewriteCount = 0;
     this.pendingDelete = undefined;
     this.pendingStaleDelete = undefined;
+    this.pendingAtomicHandoff = undefined;
+    this.nativeBackspaceRewind = undefined;
+    this.preserveNextMovedDocumentTransaction = false;
     this.moved = undefined;
     this.clearSingleRewriteEvidence();
     this.keydownSelection = undefined;
