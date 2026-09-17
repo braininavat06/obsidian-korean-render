@@ -10,6 +10,14 @@ Obsidian Mobile의 기본 Live Preview를 그대로 유지하면서, iOS/iPadOS 
 
 > v0.1.3 A/B 실기 로그에서 `blur → requestAnimationFrame → focus({preventScroll:true})`는 native stale IME state를 종료하지 못했습니다. reset 직후 첫 Korean 입력에서도 destructive delete와 stale rewrite가 동일하게 발생했고, 실기에서 cursor가 튀는 부작용도 관찰되어 해당 실험 설정과 focus cycle은 v0.1.4에서 제거했습니다.
 
+## v0.1.10
+
+v0.1.10은 v0.1.9 실제 iPad trace에서 확인된 pseudo-composition confidence lifecycle regression을 수정한 실기 검증 릴리스입니다.
+
+- 이미 증명된 Korean pseudo-composition tail이 exact delete된 뒤 같은 range에 즉시 native Hangul replacement가 적용되면, 같은 lineage의 confidence를 보존합니다. 따라서 `고 → 과`처럼 native rewrite가 이어진 뒤에도 cursor-move protection이 유지됩니다.
+- Control, Meta, Alt, Shift 단독 keydown과 아직 효과가 확인되지 않은 modifier shortcut은 valid Korean IME tracking state를 종료하지 않습니다. 실제 selection/document transaction, undo/redo, paste/drop 같은 후속 증거가 lifecycle boundary를 결정합니다.
+- modifier-only input 뒤 cursor move 및 `고 → 과 → ArrowLeft → 괍/괗` real-device regression coverage를 추가했습니다.
+
 ## v0.1.8
 
 v0.1.8은 실제 iPad/BRAT 실기 검증을 위한 lifecycle 수정 릴리스입니다.

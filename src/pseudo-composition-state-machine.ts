@@ -107,6 +107,7 @@ interface PendingDelete {
   at: number;
   range: TextRange;
   text: string;
+  provenLineage?: GuardConfidence;
   initialFragment?: InitialFragmentCandidate;
   trigger?: "korean-key" | "backspace-rewind";
 }
@@ -495,9 +496,13 @@ export class KoreanPseudoCompositionStateMachine {
     this.keydown = signal;
     this.keydownSelection = selection ? { ...selection } : undefined;
     if (signal.isComposing) return;
+    if (["Control", "Meta", "Alt", "Shift"].includes(signal.key)) {
+      return;
+    }
     if (signal.altKey || signal.ctrlKey || signal.metaKey) {
-      this.clearCompositionState();
-      this.keydown = signal;
+      // A modified keydown is not itself a session boundary. Selection,
+      // beforeinput, or the resulting CodeMirror transaction carries the
+      // evidence needed to terminate or move the lineage.
       return;
     }
     if (signal.key === "Backspace") {
@@ -1195,6 +1200,12 @@ export class KoreanPseudoCompositionStateMachine {
         at: signal.at,
         range: { from: signal.from, to: signal.to },
         text: signal.deletedText,
+        provenLineage:
+          this.rewriteCount >= PSEUDO_MIN_REWRITES
+            ? "multi-rewrite"
+            : this.singleRewriteLineage !== undefined
+              ? "single-confirmed-lineage"
+              : undefined,
         trigger: "korean-key",
         initialFragment: exactInitialFragmentDelete
           ? { ...candidate, range: { ...candidate.range } }
@@ -1383,7 +1394,10 @@ export class KoreanPseudoCompositionStateMachine {
       recentInsertBeforeInput &&
       inputTypeEvent(signal.userEvent) &&
       signal.from === pending.range.from &&
-      isConnectedHangulRewrite(pending.text, signal.insert)
+      signal.from === signal.to &&
+      isHangulText(signal.insert) &&
+      (isConnectedHangulRewrite(pending.text, signal.insert) ||
+        pending.provenLineage !== undefined)
     ) {
       const previousWasTracked =
         this.lastRange !== undefined &&
