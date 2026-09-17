@@ -107,6 +107,10 @@ class KoreanImeViewTracker {
           transactionUserEvent,
           transaction.docChanged,
           transaction.annotation(imeSuppression) === "pseudo-atomic-repair",
+          {
+            from: transaction.newSelection.main.from,
+            to: transaction.newSelection.main.to,
+          },
         );
         let changeCount = 0;
         let transactionFrom = -1;

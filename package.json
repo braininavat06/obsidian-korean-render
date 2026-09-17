@@ -1,6 +1,6 @@
 {
   "name": "obsidian-korean-render",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Korean Render: a conservative Korean IME workaround for Obsidian Mobile Live Preview",
   "main": "main.js",
   "type": "module",

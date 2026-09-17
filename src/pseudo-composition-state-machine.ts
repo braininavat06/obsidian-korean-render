@@ -44,7 +44,12 @@ export type PseudoDecision =
       range: TextRange;
       repairRange: TextRange;
       staleText: string;
-      deleteSource: "exact-continuation" | "shifted-native-tail" | "protected-document" | "backspace-rewind-spill";
+      deleteSource:
+        | "exact-continuation"
+        | "shifted-native-tail"
+        | "protected-document"
+        | "backspace-rewind-spill"
+        | "post-history-native";
     }
   | {
       kind: "atomic-repair";
@@ -76,10 +81,21 @@ export interface PseudoDebugSnapshot {
     singleRewriteLineage: SingleRewriteLineageSnapshot | null;
   };
   nativeBackspaceRewind: {
+    kind: NativeBackspaceKind;
     phase: NativeBackspacePhase;
     keyAt: number;
     mutableRange: TextRange;
     mutableText: string;
+    nativeTailText: string;
+    confidence: GuardConfidence | null;
+    deleteApplied: boolean;
+  } | null;
+  detachedNativeLineage: {
+    historyEvent: "undo" | "redo";
+    nativeTailText: string;
+    confidence: GuardConfidence;
+    destination: SelectionSnapshot;
+    source: "active" | "moved";
   } | null;
   selectionMovedOutsidePseudoRange: boolean;
   movedGuard: {
@@ -144,14 +160,41 @@ interface PendingStaleDelete {
 }
 
 type NativeBackspacePhase = "armed" | "delete-accepted" | "rewrite-completed" | "spill-suppressed";
+type NativeBackspaceKind = "mutable-rewind" | "moved-residual";
 
 interface NativeBackspaceRewind {
+  kind: NativeBackspaceKind;
   keyAt: number;
   selection: SelectionSnapshot;
   mutableRange: TextRange;
   mutableText: string;
+  nativeTailText: string;
+  confidence?: GuardConfidence;
   phase: NativeBackspacePhase;
+  expectedSelectionAfterDelete?: SelectionSnapshot;
+  deleteApplied: boolean;
   spillAt?: number;
+}
+
+interface DetachedNativeLineage {
+  historyEvent: "undo" | "redo";
+  nativeTailText: string;
+  confidence: GuardConfidence;
+  destination: SelectionSnapshot;
+  source: "active" | "moved";
+}
+
+interface PendingDetachedStaleDelete {
+  at: number;
+  originalText: string;
+  attemptedRange: TextRange;
+  intendedKey: string;
+  lineage: DetachedNativeLineage;
+}
+
+interface PendingDetachedAtomicRepair {
+  key: string;
+  at: number;
 }
 
 type PendingAtomicHandoff =
@@ -405,11 +448,9 @@ function isObservedBackspaceReplacement(previous: string, inserted: string): boo
   if (!oneCodePoint(previous) || !oneCodePoint(inserted)) return false;
   const previousParts = syllableParts(previous);
   const insertedParts = syllableParts(inserted);
-  return (
-    previousParts !== undefined &&
-    insertedParts !== undefined &&
-    previousParts.lead === insertedParts.lead
-  );
+  if (!previousParts) return false;
+  if (insertedParts) return previousParts.lead === insertedParts.lead;
+  return compatibilityPart(inserted).lead === previousParts.lead;
 }
 
 function recent(signalAt: number, eventAt: number | undefined, windowMs: number): boolean {
@@ -454,6 +495,9 @@ export class KoreanPseudoCompositionStateMachine {
   private pendingPostDeleteReplayGuard: PendingPostDeleteReplayGuard | undefined;
   private pendingAtomicHandoff: PendingAtomicHandoff | undefined;
   private nativeBackspaceRewind: NativeBackspaceRewind | undefined;
+  private detachedNativeLineage: DetachedNativeLineage | undefined;
+  private pendingDetachedStaleDelete: PendingDetachedStaleDelete | undefined;
+  private pendingDetachedAtomicRepair: PendingDetachedAtomicRepair | undefined;
   private preserveNextMovedDocumentTransaction = false;
   private readonly diagnostics: PseudoDiagnostic[] = [];
 
@@ -509,9 +553,11 @@ export class KoreanPseudoCompositionStateMachine {
       const existingRewind = this.nativeBackspaceRewind;
       if (
         existingRewind &&
+        !existingRewind.deleteApplied &&
         selection &&
         (existingRewind.phase === "armed" || existingRewind.phase === "delete-accepted") &&
-        sameSelection(selection, existingRewind.selection)
+        sameSelection(selection, existingRewind.selection) &&
+        recent(signal.at, existingRewind.keyAt, PSEUDO_INPUT_ASSOCIATION_MS)
       ) {
         // iPadOS can emit a second non-repeat keydown after the DOM delete but
         // before CodeMirror publishes the transaction. That event belongs to
@@ -525,14 +571,60 @@ export class KoreanPseudoCompositionStateMachine {
         sameSelection(selection, cursorAt(mutable.range.to))
       ) {
         this.nativeBackspaceRewind = {
+          kind: "mutable-rewind",
           keyAt: signal.at,
           selection: { ...selection },
           mutableRange: { ...mutable.range },
           mutableText: mutable.text,
+          nativeTailText: mutable.text,
+          confidence: this.currentGuardConfidence(),
           phase: "armed",
+          deleteApplied: false,
         };
         this.pendingDelete = undefined;
         this.pendingStaleDelete = undefined;
+        return;
+      }
+      if (
+        this.moved &&
+        selection &&
+        collapsed(selection) &&
+        sameSelection(selection, this.moved.destination)
+      ) {
+        const moved = this.moved;
+        this.nativeBackspaceRewind = {
+          kind: "moved-residual",
+          keyAt: signal.at,
+          selection: { ...selection },
+          mutableRange: { from: selection.from, to: selection.to },
+          mutableText: "",
+          nativeTailText: moved.nativeTailText,
+          confidence: moved.guardConfidence,
+          phase: "armed",
+          deleteApplied: false,
+        };
+        this.clearRangeBoundTracking();
+        return;
+      }
+      if (
+        this.detachedNativeLineage &&
+        selection &&
+        collapsed(selection) &&
+        sameSelection(selection, this.detachedNativeLineage.destination)
+      ) {
+        const detached = this.detachedNativeLineage;
+        this.nativeBackspaceRewind = {
+          kind: "moved-residual",
+          keyAt: signal.at,
+          selection: { ...selection },
+          mutableRange: { from: selection.from, to: selection.to },
+          mutableText: "",
+          nativeTailText: detached.nativeTailText,
+          confidence: detached.confidence,
+          phase: "armed",
+          deleteApplied: false,
+        };
+        this.clearRangeBoundTracking();
         return;
       }
       this.clearCompositionState();
@@ -583,8 +675,36 @@ export class KoreanPseudoCompositionStateMachine {
   onSelectionMove(signal: SelectionMoveSignal): boolean {
     this.expirePostDeleteReplayGuard(signal.at);
     this.pendingSelectionDeleteKey = undefined;
+    const rewind = this.nativeBackspaceRewind;
+    const expectedBackspaceSelectionUpdate =
+      rewind !== undefined &&
+      rewind.phase === "delete-accepted" &&
+      !rewind.deleteApplied &&
+      rewind.expectedSelectionAfterDelete !== undefined &&
+      sameSelection(signal.before, rewind.selection) &&
+      sameSelection(signal.after, rewind.expectedSelectionAfterDelete) &&
+      collapsed(signal.after) &&
+      signal.origin === "other";
+    if (expectedBackspaceSelectionUpdate) {
+      rewind.selection = { ...signal.after };
+      return false;
+    }
     this.nativeBackspaceRewind = undefined;
     this.disarmPostDeleteReplayGuard("selection-change");
+
+    if (this.detachedNativeLineage) {
+      if (
+        signal.origin !== "other" &&
+        collapsed(signal.after)
+      ) {
+        this.detachedNativeLineage.destination = { ...signal.after };
+        return false;
+      }
+      if (!sameSelection(signal.before, signal.after)) {
+        this.detachedNativeLineage = undefined;
+        this.pendingDetachedStaleDelete = undefined;
+      }
+    }
     if (
       signal.origin === "other" ||
       sameSelection(signal.before, signal.after) ||
@@ -734,14 +854,28 @@ export class KoreanPseudoCompositionStateMachine {
     userEvent: string | undefined,
     docChanged: boolean,
     preserveMovedGuard = false,
+    selectionAfter?: SelectionSnapshot,
   ): void {
     if (!docChanged) return;
+    if (userEvent === "undo" || userEvent === "redo") {
+      const provenance = this.currentNativeProvenance();
+      this.disarmPostDeleteReplayGuard(userEvent);
+      this.clearCompositionState();
+      if (provenance && selectionAfter && collapsed(selectionAfter)) {
+        this.detachedNativeLineage = {
+          historyEvent: userEvent,
+          nativeTailText: provenance.nativeTailText,
+          confidence: provenance.confidence,
+          destination: { ...selectionAfter },
+          source: provenance.source,
+        };
+      }
+      return;
+    }
     const preserveLifecycle = this.preserveNextMovedDocumentTransaction;
     this.preserveNextMovedDocumentTransaction = false;
     this.disarmPostDeleteReplayGuard(
-      userEvent === "undo" || userEvent === "redo"
-        ? userEvent
-        : "other-document-transaction",
+      "other-document-transaction",
     );
     if (this.moved && !preserveMovedGuard && !preserveLifecycle) {
       this.clearCompositionState();
@@ -749,7 +883,7 @@ export class KoreanPseudoCompositionStateMachine {
     }
     if (
       !preserveLifecycle &&
-      (userEvent === "undo" || userEvent === "redo" || !userEvent?.startsWith("input.type"))
+      !userEvent?.startsWith("input.type")
     ) {
       this.clearCompositionState();
     }
@@ -765,13 +899,17 @@ export class KoreanPseudoCompositionStateMachine {
       signal.to === rewind.mutableRange.to &&
       signal.insert === ""
     ) {
-      this.active = false;
-      this.lastRange = undefined;
-      this.lastText = "";
-      this.lastRewriteTime = 0;
-      this.rewriteCount = 0;
-      this.moved = undefined;
-      this.clearSingleRewriteEvidence();
+      rewind.deleteApplied = true;
+      rewind.selection = { ...signal.selectionAfter };
+      rewind.expectedSelectionAfterDelete = { ...signal.selectionAfter };
+      if (rewind.kind === "mutable-rewind") {
+        const pendingBackspaceDelete =
+          this.pendingDelete?.trigger === "backspace-rewind"
+            ? this.pendingDelete
+            : undefined;
+        this.clearRangeBoundTracking();
+        this.pendingDelete = pendingBackspaceDelete;
+      }
     }
     const pending = this.pendingSelectionDeleteKey;
     this.pendingSelectionDeleteKey = undefined;
@@ -817,6 +955,35 @@ export class KoreanPseudoCompositionStateMachine {
   }
 
   commitAtomicRepair(decision: AtomicRepairDecision): void {
+    const detachedRepair = this.pendingDetachedAtomicRepair;
+    if (detachedRepair) {
+      this.pendingDetachedAtomicRepair = undefined;
+      this.detachedNativeLineage = undefined;
+      const tail = Array.from(decision.insert).at(-1) ?? "";
+      this.active = tail.length > 0;
+      this.lastRange = tail
+        ? {
+            from: decision.replace.from + decision.insert.length - tail.length,
+            to: decision.replace.from + decision.insert.length,
+          }
+        : undefined;
+      this.lastText = tail;
+      this.lastRewriteTime = detachedRepair.at;
+      this.rewriteCount = 0;
+      this.initialFragmentCandidate =
+        tail === detachedRepair.key &&
+        isCompatibilityLead(tail) &&
+        this.lastRange
+          ? {
+              insertedAt: detachedRepair.at,
+              range: { ...this.lastRange },
+              text: tail,
+              key: detachedRepair.key,
+            }
+          : undefined;
+      this.singleRewriteLineage = undefined;
+      return;
+    }
     const moved = this.moved;
     if (!moved) return;
     const handoff = this.pendingAtomicHandoff;
@@ -991,10 +1158,23 @@ export class KoreanPseudoCompositionStateMachine {
         : null,
       nativeBackspaceRewind: this.nativeBackspaceRewind
         ? {
+            kind: this.nativeBackspaceRewind.kind,
             phase: this.nativeBackspaceRewind.phase,
             keyAt: this.nativeBackspaceRewind.keyAt,
             mutableRange: { ...this.nativeBackspaceRewind.mutableRange },
             mutableText: this.nativeBackspaceRewind.mutableText,
+            nativeTailText: this.nativeBackspaceRewind.nativeTailText,
+            confidence: this.nativeBackspaceRewind.confidence ?? null,
+            deleteApplied: this.nativeBackspaceRewind.deleteApplied,
+          }
+        : null,
+      detachedNativeLineage: this.detachedNativeLineage
+        ? {
+            historyEvent: this.detachedNativeLineage.historyEvent,
+            nativeTailText: this.detachedNativeLineage.nativeTailText,
+            confidence: this.detachedNativeLineage.confidence,
+            destination: { ...this.detachedNativeLineage.destination },
+            source: this.detachedNativeLineage.source,
           }
         : null,
     };
@@ -1015,6 +1195,40 @@ export class KoreanPseudoCompositionStateMachine {
       !keydown.metaKey &&
       recent(signal.at, keydown.at, PSEUDO_INPUT_ASSOCIATION_MS);
 
+    const detached = this.detachedNativeLineage;
+    if (
+      detached &&
+      recentDeleteBeforeInput &&
+      recentKoreanKey &&
+      inputTypeEvent(signal.userEvent) &&
+      signal.docChanged &&
+      oneCodePoint(signal.deletedText) &&
+      !signal.deletedText.includes("\n") &&
+      sameSelection(signal.selectionBefore, detached.destination) &&
+      this.keydownSelection !== undefined &&
+      sameSelection(this.keydownSelection, detached.destination) &&
+      (signal.to === detached.destination.to || signal.from === detached.destination.to)
+    ) {
+      this.pendingDetachedStaleDelete = {
+        at: signal.at,
+        originalText: signal.deletedText,
+        attemptedRange: { from: signal.from, to: signal.to },
+        intendedKey: keydown.key,
+        lineage: {
+          ...detached,
+          destination: { ...detached.destination },
+        },
+      };
+      return {
+        kind: "suppress-stale-delete",
+        originalText: signal.deletedText,
+        range: { from: signal.from, to: signal.to },
+        repairRange: { ...detached.destination },
+        staleText: detached.nativeTailText,
+        deleteSource: "post-history-native",
+      };
+    }
+
     const rewind = this.nativeBackspaceRewind;
     const recentPhysicalBackspace =
       rewind !== undefined &&
@@ -1033,18 +1247,37 @@ export class KoreanPseudoCompositionStateMachine {
       !signal.deletedText.includes("\n")
     ) {
       const exactMutableDelete =
+        rewind.kind === "mutable-rewind" &&
         rewind.phase === "armed" &&
         sameRange(rewind.mutableRange, { from: signal.from, to: signal.to }) &&
         signal.deletedText === rewind.mutableText &&
         sameSelection(signal.selectionBefore, rewind.selection);
       if (exactMutableDelete) {
         rewind.phase = "delete-accepted";
+        rewind.expectedSelectionAfterDelete = { ...signal.selectionAfter };
         this.pendingDelete = {
           at: signal.at,
           range: { from: signal.from, to: signal.to },
           text: signal.deletedText,
           trigger: "backspace-rewind",
         };
+        this.preserveNextMovedDocumentTransaction = true;
+        return { kind: "allow" };
+      }
+
+      const intendedMovedBackspaceDelete =
+        rewind.kind === "moved-residual" &&
+        rewind.phase === "armed" &&
+        sameSelection(signal.selectionBefore, rewind.selection) &&
+        signal.to === rewind.selection.to &&
+        signal.from < signal.to &&
+        oneCodePoint(signal.deletedText);
+      if (intendedMovedBackspaceDelete) {
+        rewind.phase = "delete-accepted";
+        rewind.mutableRange = { from: signal.from, to: signal.to };
+        rewind.mutableText = signal.deletedText;
+        rewind.expectedSelectionAfterDelete = { ...signal.selectionAfter };
+        this.pendingDelete = undefined;
         this.preserveNextMovedDocumentTransaction = true;
         return { kind: "allow" };
       }
@@ -1250,7 +1483,71 @@ export class KoreanPseudoCompositionStateMachine {
       this.disarmPostDeleteReplayGuard("non-matching-input-transaction");
     }
 
+    const pendingHistoryDelete = this.pendingDetachedStaleDelete;
+    if (pendingHistoryDelete) {
+      const lineage = pendingHistoryDelete.lineage;
+      const linkedInsertion =
+        signal.at - pendingHistoryDelete.at <= PSEUDO_REWRITE_PAIR_MS &&
+        recentInsertBeforeInput &&
+        inputTypeEvent(signal.userEvent) &&
+        isHangulText(signal.insert) &&
+        signal.from === signal.to &&
+        signal.from === lineage.destination.from &&
+        sameSelection(signal.selectionBefore, lineage.destination)
+          ? this.deriveIntendedText(
+              lineage.nativeTailText,
+              lineage.nativeTailText,
+              pendingHistoryDelete.intendedKey,
+              signal.insert,
+              pendingHistoryDelete.originalText,
+              undefined,
+            )
+          : undefined;
+      this.pendingDetachedStaleDelete = undefined;
+      if (linkedInsertion) {
+        this.pendingDetachedAtomicRepair = {
+          key: pendingHistoryDelete.intendedKey,
+          at: signal.at,
+        };
+        return {
+          kind: "atomic-repair",
+          insert: linkedInsertion.text,
+          replace: { ...lineage.destination },
+          staleText: lineage.nativeTailText,
+          originalText: pendingHistoryDelete.originalText,
+          source: linkedInsertion.source,
+          nativeTailText: signal.insert,
+        };
+      }
+      this.detachedNativeLineage = undefined;
+    }
+
     const rewind = this.nativeBackspaceRewind;
+    if (rewind?.kind === "moved-residual" && rewind.phase === "delete-accepted") {
+      const connectedResidualReplay =
+        signal.at - rewind.keyAt <= PSEUDO_INPUT_ASSOCIATION_MS &&
+        recentInsertBeforeInput &&
+        inputTypeEvent(signal.userEvent) &&
+        isHangulText(signal.insert) &&
+        this.keydown?.key === "Backspace" &&
+        signal.from === signal.to &&
+        signal.from === rewind.selection.from &&
+        sameSelection(signal.selectionBefore, rewind.selection) &&
+        isConnectedHangulRewrite(rewind.nativeTailText, signal.insert);
+      if (connectedResidualReplay) {
+        const decision: PseudoDecision = {
+          kind: "suppress-stale-replay",
+          insert: signal.insert,
+          destination: { ...signal.selectionBefore },
+          armedAt: rewind.keyAt,
+          armReason: "physical-backspace-moved-native-residual",
+        };
+        rewind.phase = "spill-suppressed";
+        this.nativeBackspaceRewind = undefined;
+        return decision;
+      }
+      this.nativeBackspaceRewind = undefined;
+    }
     if (
       rewind?.phase === "spill-suppressed" &&
       rewind.spillAt !== undefined &&
@@ -1303,7 +1600,9 @@ export class KoreanPseudoCompositionStateMachine {
       rewind.phase = "rewrite-completed";
       rewind.mutableRange = { ...this.lastRange };
       rewind.mutableText = tail;
+      rewind.nativeTailText = tail;
       rewind.selection = cursorAt(this.lastRange.to);
+      rewind.expectedSelectionAfterDelete = undefined;
       return { kind: "allow" };
     }
 
@@ -1496,6 +1795,8 @@ export class KoreanPseudoCompositionStateMachine {
     }
     if (recentInsertBeforeInput && inputTypeEvent(signal.userEvent) && isHangulText(signal.insert)) {
       if (this.moved) this.clearCompositionState();
+      this.detachedNativeLineage = undefined;
+      this.pendingDetachedStaleDelete = undefined;
       const tail = Array.from(signal.insert).at(-1) ?? "";
       this.active = true;
       this.lastRange = {
@@ -1624,6 +1925,37 @@ export class KoreanPseudoCompositionStateMachine {
     return undefined;
   }
 
+  private currentGuardConfidence(): GuardConfidence | undefined {
+    if (this.rewriteCount >= PSEUDO_MIN_REWRITES) return "multi-rewrite";
+    if (this.singleRewriteLineage) return "single-confirmed-lineage";
+    return undefined;
+  }
+
+  private currentNativeProvenance():
+    | {
+        nativeTailText: string;
+        confidence: GuardConfidence;
+        source: "active" | "moved";
+      }
+    | undefined {
+    if (this.moved && this.moved.nativeTailText) {
+      return {
+        nativeTailText: this.moved.nativeTailText,
+        confidence: this.moved.guardConfidence,
+        source: "moved",
+      };
+    }
+    const confidence = this.currentGuardConfidence();
+    if (this.active && this.lastText && confidence) {
+      return {
+        nativeTailText: this.lastText,
+        confidence,
+        source: "active",
+      };
+    }
+    return undefined;
+  }
+
   private disarmPostDeleteReplayGuard(reason: string): void {
     const guard = this.pendingPostDeleteReplayGuard;
     if (!guard) return;
@@ -1639,7 +1971,7 @@ export class KoreanPseudoCompositionStateMachine {
     });
   }
 
-  private clearCompositionState(): void {
+  private clearRangeBoundTracking(): void {
     this.active = false;
     this.lastRange = undefined;
     this.lastText = "";
@@ -1648,11 +1980,18 @@ export class KoreanPseudoCompositionStateMachine {
     this.pendingDelete = undefined;
     this.pendingStaleDelete = undefined;
     this.pendingAtomicHandoff = undefined;
-    this.nativeBackspaceRewind = undefined;
+    this.pendingDetachedStaleDelete = undefined;
+    this.pendingDetachedAtomicRepair = undefined;
+    this.detachedNativeLineage = undefined;
     this.preserveNextMovedDocumentTransaction = false;
     this.moved = undefined;
     this.clearSingleRewriteEvidence();
     this.keydownSelection = undefined;
+  }
+
+  private clearCompositionState(): void {
+    this.clearRangeBoundTracking();
+    this.nativeBackspaceRewind = undefined;
   }
 
   private clearSingleRewriteEvidence(): void {
