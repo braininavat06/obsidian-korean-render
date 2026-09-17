@@ -20,6 +20,15 @@ v0.1.8은 실제 iPad/BRAT 실기 검증을 위한 lifecycle 수정 릴리스입
 - stale native continuation이 moved destination의 기존 document text를 삭제하지 못하도록 보호합니다.
 - v0.1.7 lifecycle trace를 축약한 handoff, `셈/세므`, Backspace rewind regression coverage를 추가했습니다.
 
+## v0.1.9
+
+v0.1.9는 v0.1.8 실제 iPad/BRAT trace에서 확인된 세 가지 lifecycle regression을 수정한 실기 검증 릴리스입니다.
+
+- cursor 이동 뒤 native delete 없이 stale Hangul이 직접 insert되는 경우, 실제 Korean key와 기존 native tail의 연결이 증명되면 stale text 대신 신규 입력만 repair합니다.
+- iPadOS의 duplicate non-repeat Backspace keydown 및 실제 `delete.backward` transaction을 지나도 Backspace rewind lifecycle을 유지합니다. 현재 음절의 정상 rewind는 허용하면서 document-owned text 침범과 뒤따르는 stale insertion은 차단합니다.
+- moved repair가 intended tail, native tail 및 실제 document tail의 exact delete를 통해 재동기화됐음을 확인하면, `호 → 화` 같은 정상 native continuation을 raw Jamo로 분해하지 않고 관측된 native result를 사용합니다.
+- direct stale insert, Backspace rewind/spill, `호 → 화`, 전체 `화려강산` native continuation의 실제 trace 기반 regression coverage를 추가했습니다.
+
 ## v0.1.4
 
 v0.1.4는 v0.1.3의 실제 iPadOS + Bluetooth keyboard A/B trace를 ground truth로 삼아 repair 경로를 보수적으로 수정한 릴리스입니다.

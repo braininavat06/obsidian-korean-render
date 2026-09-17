@@ -91,6 +91,7 @@ export interface PseudoDebugSnapshot {
     intendedRange: TextRange | null;
     intendedText: string;
     guardConfidence: GuardConfidence;
+    nativeState: MovedNativeState;
     singleRewriteLineage: SingleRewriteLineageSnapshot | null;
   } | null;
   pendingPostDeleteReplayGuard: {
@@ -137,6 +138,7 @@ interface PendingStaleDelete {
   repairRange: TextRange;
   intendedKey: string;
   deleteSource: "exact-continuation" | "shifted-native-tail" | "protected-document";
+  nativeTailSynchronized: boolean;
   initialFragment?: InitialFragmentCandidate;
 }
 
@@ -170,8 +172,11 @@ interface MovedPseudoComposition {
   destination: SelectionSnapshot;
   intended?: { range: TextRange; text: string };
   guardConfidence: GuardConfidence;
+  nativeState: MovedNativeState;
   singleRewriteLineage?: SingleRewriteLineageSnapshot;
 }
+
+type MovedNativeState = "desynchronized" | "repairing" | "synchronized";
 
 interface PendingSelectionDeleteKey {
   at: number;
@@ -395,6 +400,17 @@ function isDirectHangulRewrite(previous: string, inserted: string): boolean {
   return first !== undefined && isConnectedHangulRewrite(previous, first);
 }
 
+function isObservedBackspaceReplacement(previous: string, inserted: string): boolean {
+  if (!oneCodePoint(previous) || !oneCodePoint(inserted)) return false;
+  const previousParts = syllableParts(previous);
+  const insertedParts = syllableParts(inserted);
+  return (
+    previousParts !== undefined &&
+    insertedParts !== undefined &&
+    previousParts.lead === insertedParts.lead
+  );
+}
+
 function recent(signalAt: number, eventAt: number | undefined, windowMs: number): boolean {
   return eventAt !== undefined && signalAt >= eventAt && signalAt - eventAt <= windowMs;
 }
@@ -485,6 +501,18 @@ export class KoreanPseudoCompositionStateMachine {
       return;
     }
     if (signal.key === "Backspace") {
+      const existingRewind = this.nativeBackspaceRewind;
+      if (
+        existingRewind &&
+        selection &&
+        (existingRewind.phase === "armed" || existingRewind.phase === "delete-accepted") &&
+        sameSelection(selection, existingRewind.selection)
+      ) {
+        // iPadOS can emit a second non-repeat keydown after the DOM delete but
+        // before CodeMirror publishes the transaction. That event belongs to
+        // the in-flight Backspace burst and must not re-arm its lifecycle.
+        return;
+      }
       const mutable = selection && collapsed(selection) ? this.currentMutableTail() : undefined;
       if (
         mutable &&
@@ -583,6 +611,7 @@ export class KoreanPseudoCompositionStateMachine {
           nativeTailText: this.lastText,
           destination: signal.after,
           guardConfidence: "single-confirmed-lineage",
+          nativeState: "desynchronized",
           singleRewriteLineage: copyLineage(this.singleRewriteLineage),
         };
         this.initialFragmentCandidate = undefined;
@@ -592,6 +621,7 @@ export class KoreanPseudoCompositionStateMachine {
       }
       this.moved.destination = signal.after;
       this.moved.intended = undefined;
+      this.moved.nativeState = "desynchronized";
       this.pendingStaleDelete = undefined;
       return true;
     }
@@ -630,6 +660,7 @@ export class KoreanPseudoCompositionStateMachine {
       nativeTailText: this.lastText,
       destination: signal.after,
       guardConfidence,
+      nativeState: "desynchronized",
       singleRewriteLineage:
         guardConfidence === "single-confirmed-lineage" && this.singleRewriteLineage
           ? copyLineage(this.singleRewriteLineage)
@@ -711,7 +742,10 @@ export class KoreanPseudoCompositionStateMachine {
       this.clearCompositionState();
       return;
     }
-    if (userEvent === "undo" || userEvent === "redo" || !userEvent?.startsWith("input.type")) {
+    if (
+      !preserveLifecycle &&
+      (userEvent === "undo" || userEvent === "redo" || !userEvent?.startsWith("input.type"))
+    ) {
       this.clearCompositionState();
     }
   }
@@ -827,6 +861,12 @@ export class KoreanPseudoCompositionStateMachine {
       to: moved.intended.range.to,
     };
     moved.nativeTailText = nativeTail;
+    moved.nativeState =
+      decision.source === "native-rewrite" &&
+      nativeTail.length > 0 &&
+      moved.intended.text.endsWith(nativeTail)
+        ? "synchronized"
+        : "repairing";
     this.pendingStaleDelete = undefined;
 
     if (
@@ -929,6 +969,7 @@ export class KoreanPseudoCompositionStateMachine {
             intendedRange: this.moved.intended ? { ...this.moved.intended.range } : null,
             intendedText: this.moved.intended?.text ?? "",
             guardConfidence: this.moved.guardConfidence,
+            nativeState: this.moved.nativeState,
             singleRewriteLineage: this.moved.singleRewriteLineage
               ? copyLineage(this.moved.singleRewriteLineage)
               : null,
@@ -1039,6 +1080,13 @@ export class KoreanPseudoCompositionStateMachine {
           oneCodePoint(signal.deletedText) &&
           !sameRange(this.moved.protectedSourceRange, { from: signal.from, to: signal.to });
       const nativeTailLength = this.moved.nativeTailText.length;
+      const synchronizedNativeTailDelete =
+        intended !== undefined &&
+        nativeTailLength > 0 &&
+        sameRange(this.moved.nativeTailRange, { from: signal.from, to: signal.to }) &&
+        signal.deletedText === this.moved.nativeTailText &&
+        intended.range.to === this.moved.nativeTailRange.to &&
+        intended.text.endsWith(this.moved.nativeTailText);
       const shiftedNativeTailDelete =
         intended !== undefined &&
         nativeTailLength > 0 &&
@@ -1090,6 +1138,9 @@ export class KoreanPseudoCompositionStateMachine {
         if (shiftedNativeTailDelete) {
           this.moved.nativeTailRange = { from: signal.from, to: signal.to };
         }
+        if (synchronizedNativeTailDelete) {
+          this.moved.nativeState = "synchronized";
+        }
         const candidate = this.initialFragmentCandidate;
         const exactInitialFragmentDelete =
           candidate !== undefined &&
@@ -1104,6 +1155,7 @@ export class KoreanPseudoCompositionStateMachine {
           repairRange,
           intendedKey: keydown.key,
           deleteSource,
+          nativeTailSynchronized: synchronizedNativeTailDelete,
           initialFragment: exactInitialFragmentDelete
             ? { ...candidate, range: { ...candidate.range } }
             : undefined,
@@ -1217,7 +1269,8 @@ export class KoreanPseudoCompositionStateMachine {
         inputTypeEvent(signal.userEvent) &&
         signal.from === pendingBackspace.range.from &&
         signal.from === signal.to &&
-        isConnectedHangulRewrite(pendingBackspace.text, signal.insert);
+        (isConnectedHangulRewrite(pendingBackspace.text, signal.insert) ||
+          isObservedBackspaceReplacement(pendingBackspace.text, signal.insert));
       this.pendingDelete = undefined;
       if (!connectedReplacement || !rewind) {
         // Without a connected native rewind there is not enough evidence to
@@ -1257,14 +1310,22 @@ export class KoreanPseudoCompositionStateMachine {
         return { kind: "allow" };
       }
 
-      const intended = this.deriveIntendedText(
-        this.moved.protectedSourceText,
-        this.moved.nativeTailText,
-        pending.intendedKey,
-        signal.insert,
-        pending.originalText,
-        this.moved.intended?.text,
-      );
+      const synchronizedIntended =
+        pending.nativeTailSynchronized && this.moved.intended
+          ? this.deriveSynchronizedNativeResult(
+              this.moved.intended,
+              pending.repairRange,
+              signal.insert,
+            )
+          : undefined;
+      const intended = synchronizedIntended ?? this.deriveIntendedText(
+          this.moved.protectedSourceText,
+          this.moved.nativeTailText,
+          pending.intendedKey,
+          signal.insert,
+          pending.originalText,
+          this.moved.intended?.text,
+        );
       const replace = intended
         ? this.moved.intended
           ? intended.replaceWholeIntended
@@ -1375,6 +1436,50 @@ export class KoreanPseudoCompositionStateMachine {
     }
 
     this.pendingDelete = undefined;
+    const keydown = this.keydown;
+    const directMovedInsert =
+      this.moved !== undefined &&
+      this.moved.nativeState !== "synchronized" &&
+      recentInsertBeforeInput &&
+      inputTypeEvent(signal.userEvent) &&
+      signal.docChanged &&
+      signal.from === signal.to &&
+      sameSelection(signal.selectionBefore, this.moved.destination) &&
+      this.keydownSelection !== undefined &&
+      sameSelection(this.keydownSelection, this.moved.destination) &&
+      keydown !== undefined &&
+      isHangulInputKey(keydown.key) &&
+      !keydown.isComposing &&
+      !keydown.altKey &&
+      !keydown.ctrlKey &&
+      !keydown.metaKey &&
+      recent(signal.at, keydown.at, PSEUDO_INPUT_ASSOCIATION_MS) &&
+      isHangulText(signal.insert) &&
+      signal.sourceStillPresent;
+    if (directMovedInsert && this.moved && keydown) {
+      const intended = this.deriveIntendedText(
+        this.moved.protectedSourceText,
+        this.moved.nativeTailText,
+        keydown.key,
+        signal.insert,
+        this.moved.nativeTailText,
+        this.moved.intended?.text,
+      );
+      if (intended) {
+        const replace = this.moved.intended && intended.replaceWholeIntended
+          ? this.moved.intended.range
+          : { ...this.moved.destination };
+        return {
+          kind: "atomic-repair",
+          insert: intended.text,
+          replace,
+          staleText: this.moved.nativeTailText,
+          originalText: "",
+          source: intended.source,
+          nativeTailText: signal.insert,
+        };
+      }
+    }
     if (recentInsertBeforeInput && inputTypeEvent(signal.userEvent) && isHangulText(signal.insert)) {
       if (this.moved) this.clearCompositionState();
       const tail = Array.from(signal.insert).at(-1) ?? "";
@@ -1386,7 +1491,6 @@ export class KoreanPseudoCompositionStateMachine {
       this.lastText = tail;
       this.lastRewriteTime = signal.at;
       this.rewriteCount = 0;
-      const keydown = this.keydown;
       const eligibleInitialFragment =
         signal.docChanged &&
         isCompatibilityLead(signal.insert) &&
@@ -1454,6 +1558,33 @@ export class KoreanPseudoCompositionStateMachine {
       return { text: inserted, source: "native-rewrite" };
     }
     return undefined;
+  }
+
+  private deriveSynchronizedNativeResult(
+    intended: { range: TextRange; text: string },
+    replacedRange: TextRange,
+    inserted: string,
+  ):
+    | {
+        text: string;
+        source: "native-rewrite";
+        replaceWholeIntended?: boolean;
+      }
+    | undefined {
+    if (!isHangulText(inserted)) return undefined;
+    if (
+      replacedRange.from < intended.range.from ||
+      replacedRange.to !== intended.range.to ||
+      replacedRange.from >= replacedRange.to
+    ) {
+      return undefined;
+    }
+    const relativeFrom = replacedRange.from - intended.range.from;
+    const prefix = intended.text.slice(0, relativeFrom);
+    if (replacedRange.from === intended.range.from || inserted.startsWith(prefix)) {
+      return { text: inserted, source: "native-rewrite", replaceWholeIntended: true };
+    }
+    return { text: inserted, source: "native-rewrite" };
   }
 
   private expirePostDeleteReplayGuard(at: number): void {
