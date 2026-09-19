@@ -102,27 +102,19 @@ class KoreanImeViewTracker {
     if (this.controller.isFixEnabled()) {
       for (const transaction of update.transactions) {
         const transactionUserEvent = transaction.annotation(Transaction.userEvent);
-        this.machine.onTransaction(transactionUserEvent, transaction.docChanged);
-        this.pseudo.onDocumentTransaction(
-          transactionUserEvent,
-          transaction.docChanged,
-          transaction.annotation(imeSuppression) === "pseudo-atomic-repair",
-          {
-            from: transaction.newSelection.main.from,
-            to: transaction.newSelection.main.to,
-          },
-        );
         let changeCount = 0;
         let transactionFrom = -1;
         let transactionTo = -1;
         let transactionInsert = "";
+        let transactionDeletedText = "";
         transaction.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
           changeCount++;
           transactionFrom = fromA;
           transactionTo = toA;
           transactionInsert = inserted.toString();
+          transactionDeletedText = transaction.startState.sliceDoc(fromA, toA);
         });
-        this.pseudo.onAppliedTransaction({
+        const appliedSignal = {
           at: Date.now(),
           userEvent: transactionUserEvent,
           docChanged: transaction.docChanged,
@@ -130,6 +122,7 @@ class KoreanImeViewTracker {
           from: transactionFrom,
           to: transactionTo,
           insert: transactionInsert,
+          deletedText: transactionDeletedText,
           selectionBefore: {
             from: transaction.startState.selection.main.from,
             to: transaction.startState.selection.main.to,
@@ -138,7 +131,28 @@ class KoreanImeViewTracker {
             from: transaction.newSelection.main.from,
             to: transaction.newSelection.main.to,
           },
-        });
+        };
+        this.machine.onTransaction(transactionUserEvent, transaction.docChanged);
+        if (transactionUserEvent === "delete.backward" && transaction.docChanged) {
+          // On iPadOS the DOM deletion may reach CodeMirror without passing
+          // through inputHandler. Observe this transaction's delete and its
+          // post-selection atomically before generic document-boundary logic.
+          this.pseudo.onAppliedTransaction(appliedSignal);
+          this.pseudo.onDocumentTransaction(
+            transactionUserEvent,
+            transaction.docChanged,
+            transaction.annotation(imeSuppression) === "pseudo-atomic-repair",
+            appliedSignal.selectionAfter,
+          );
+        } else {
+          this.pseudo.onDocumentTransaction(
+            transactionUserEvent,
+            transaction.docChanged,
+            transaction.annotation(imeSuppression) === "pseudo-atomic-repair",
+            appliedSignal.selectionAfter,
+          );
+          this.pseudo.onAppliedTransaction(appliedSignal);
+        }
       }
       this.flushPseudoDiagnostics();
     }

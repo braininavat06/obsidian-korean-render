@@ -10,6 +10,16 @@ Obsidian Mobile의 기본 Live Preview를 그대로 유지하면서, iOS/iPadOS 
 
 > v0.1.3 A/B 실기 로그에서 `blur → requestAnimationFrame → focus({preventScroll:true})`는 native stale IME state를 종료하지 못했습니다. reset 직후 첫 Korean 입력에서도 destructive delete와 stale rewrite가 동일하게 발생했고, 실기에서 cursor가 튀는 부작용도 관찰되어 해당 실험 설정과 focus cycle은 v0.1.4에서 제거했습니다.
 
+## v0.1.12
+
+v0.1.12는 v0.1.11 실제 iPad trace에서 확인된 Backspace transaction ordering, post-history native repair, pseudo-lineage handoff regression을 수정한 실기 검증 릴리스입니다.
+
+- 실제 `delete.backward` change/range/selectionAfter를 먼저 관찰해 `NativeBackspaceRewind` lifecycle을 판정합니다.
+- applied deletion이 확인될 때까지 rewind provenance를 보존하고, 정상 rewind·document-owned spill·moved-residual stale replay를 각각 구분합니다.
+- 첫 post-history repair 뒤에도 range-free repairing provenance를 이어가 second stale carry를 처리합니다.
+- prior moved guard 정리 중에도 현재 Korean keydown의 selection evidence를 보존해 strict single-confirmed-lineage를 유지합니다.
+- `native-backspace-rewind-transition` diagnostic과 v0.1.11 real-device regression fixture를 추가했습니다.
+
 ## v0.1.11
 
 v0.1.11은 v0.1.10 실제 iPad trace에서 확인된 history/native lineage와 Backspace lifecycle regression을 수정한 실기 검증 릴리스입니다.

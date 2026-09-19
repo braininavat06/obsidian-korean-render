@@ -1,0 +1,41 @@
+export const IPADOS_V011_REGRESSIONS = {
+  backspaceAtomicUpdate: [
+    "keydown:Backspace",
+    "beforeinput:deleteContentBackward",
+    "input:deleteContentBackward",
+    "keydown:Backspace:repeat=false",
+    "cm-view-update:docChanged+selectionSet:delete.backward",
+    "native-replacement-or-replay",
+  ],
+  postHistoryContinuation: {
+    nativeTailBeforeUndo: "사",
+    firstPhysicalKey: "ㅇ",
+    firstNativeResult: "상",
+    firstRepair: "ㅇ",
+    secondPhysicalKey: "ㅜ",
+    secondNativeResult: "사우",
+    secondRepair: "우",
+  },
+  singleRewritePaths: {
+    working: ["keydown:ㅇ", "insert:ㅇ", "keydown:ㅣ", "delete:ㅇ", "insert:이"],
+    priorMovedFallback: [
+      "moved-guard:active",
+      "keydown:ㅇ",
+      "unconnected-fresh-insert:ㅇ",
+      "keydown:ㅣ",
+      "delete:ㅇ",
+      "insert:이",
+    ],
+    postHistory: [
+      "history:undo",
+      "repair:ㅇ",
+      "keydown:ㅣ",
+      "delete:ㅇ",
+      "insert:이",
+      "keydown:Meta",
+      "selection-move",
+      "keydown:ㅂ",
+      "native-insert:입",
+    ],
+  },
+} as const;
